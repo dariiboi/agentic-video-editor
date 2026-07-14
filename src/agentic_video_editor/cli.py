@@ -6,11 +6,14 @@ import sys
 from pathlib import Path
 
 from .analyze import analyze_project, summarize_local_analysis
+from .context import build_editorial_context, context_summary
 from .critique import critique_render, review_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
+from .planner import create_edit_plan
 from .project import init_project, load_project
 from .render import render_summary, render_timeline
+from .retrieval import context_search, related_segments
 from .semantics import search_segments, semantic_analyze_project, semantic_summary
 from .timeline import create_timeline, get_timeline, timeline_summary
 from .transcript import search_transcripts, transcribe_project, transcript_summary
@@ -107,12 +110,47 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     semantic_summary_parser.set_defaults(func=_semantic_summary_command)
 
+    context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
+    context_build_parser.add_argument("project_dir", type=Path)
+    context_build_parser.add_argument("--provider", default="mock", choices=["gemini", "mock"])
+    context_build_parser.add_argument("--model", default=DEFAULT_MODEL)
+    context_build_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
+    context_build_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    context_build_parser.set_defaults(func=_context_build_command)
+
+    context_summary_parser = subcommands.add_parser("context-summary", help="Summarize editorial context")
+    context_summary_parser.add_argument("project_dir", type=Path)
+    context_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    context_summary_parser.set_defaults(func=_context_summary_command)
+
+    context_search_parser = subcommands.add_parser("context-search", help="Search with context-aware retrieval")
+    context_search_parser.add_argument("project_dir", type=Path)
+    context_search_parser.add_argument("query")
+    context_search_parser.add_argument("--limit", type=int, default=10)
+    context_search_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    context_search_parser.set_defaults(func=_context_search_command)
+
+    related_parser = subcommands.add_parser("related", help="Show related segments")
+    related_parser.add_argument("project_dir", type=Path)
+    related_parser.add_argument("segment_id")
+    related_parser.add_argument("--limit", type=int, default=10)
+    related_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    related_parser.set_defaults(func=_related_command)
+
+    edit_plan_parser = subcommands.add_parser("edit-plan", help="Plan a context-aware rough cut")
+    edit_plan_parser.add_argument("project_dir", type=Path)
+    edit_plan_parser.add_argument("--directive", required=True)
+    edit_plan_parser.add_argument("--duration-sec", type=float, default=60.0)
+    edit_plan_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    edit_plan_parser.set_defaults(func=_edit_plan_command)
+
     timeline_parser = subcommands.add_parser("timeline", help="Create a simple rough-cut timeline")
     timeline_parser.add_argument("project_dir", type=Path)
     timeline_parser.add_argument("--directive", required=True)
     timeline_parser.add_argument("--duration-sec", type=float, default=60.0)
     timeline_parser.add_argument("--query")
     timeline_parser.add_argument("--max-clip-sec", type=float, default=12.0)
+    timeline_parser.add_argument("--context-aware", action="store_true", help="Use editorial context planning")
     timeline_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     timeline_parser.set_defaults(func=_timeline_command)
 
@@ -334,6 +372,72 @@ def _semantic_summary_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _context_build_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = build_editorial_context(
+        project,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+    )
+    data = {
+        "source": summary.source,
+        "segments_seen": summary.segments_seen,
+        "collection_summaries": summary.collection_summaries,
+        "material_bank_items": summary.material_bank_items,
+        "context_cards": summary.context_cards,
+        "caption_options": summary.caption_options,
+    }
+    return _print_json_or_lines(args.json, data, "Context")
+
+
+def _context_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = context_summary(project)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(json.dumps(data, indent=2))
+    return 0
+
+
+def _context_search_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = context_search(project, args.query, limit=args.limit)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        for packet in data["packets"]:
+            print(f"{packet['file_name']} {packet['time_range'][0]:.1f}-{packet['time_range'][1]:.1f}:")
+            print(f"  why: {'; '.join(packet['why_matches'])}")
+            if packet["warnings"]:
+                print(f"  warnings: {', '.join(packet['warnings'])}")
+    return 0
+
+
+def _related_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = related_segments(project, args.segment_id, limit=args.limit)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        for item in data["related"]:
+            print(f"{item['segment_id']} {item['relationship_type']}: {item['summary']}")
+    return 0
+
+
+def _edit_plan_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = create_edit_plan(project, directive=args.directive, duration_sec=args.duration_sec)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"Edit plan: {data['plan_id']}")
+        for item in data["selected_sequence"]:
+            print(f"  {item['timeline_start_sec']:.1f}-{item['timeline_end_sec']:.1f} {item['beat_role']}: {item['why_here']}")
+    return 0
+
+
 def _timeline_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
     summary = create_timeline(
@@ -342,6 +446,7 @@ def _timeline_command(args: argparse.Namespace) -> int:
         duration_sec=args.duration_sec,
         query=args.query,
         max_clip_sec=args.max_clip_sec,
+        context_aware=args.context_aware,
     )
     data = {
         "timeline_id": summary.timeline_id,

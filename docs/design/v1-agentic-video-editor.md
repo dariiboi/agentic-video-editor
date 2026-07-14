@@ -357,8 +357,13 @@ Minimum tables:
 - `selects`
 - `embeddings`
 - `relationships`
-- `library_summaries`
+- `collection_summaries`
+- `material_bank_items`
+- `editorial_context_cards`
+- `intent_analyses`
+- `caption_options`
 - `directives`
+- `edit_plans`
 - `workflow_graphs`
 - `workflow_nodes`
 - `timelines`
@@ -374,6 +379,8 @@ Important distinction:
 - A `select` is an editorially valuable segment chosen for some possible use.
 - A `timeline_item` is an actual placement in an edit.
 - A `relationship` links two evidence-bearing entities, such as same-moment, setup/payoff, visual-proof, alternate-take, reaction-to, or duplicate.
+- An `editorial_context_card` is the reusable editor-memory layer for a segment: local meaning, corpus meaning, editorial use, avoid-pairing notes, caption options, and warnings.
+- An `intent_analysis` records the explicit and implicit directive interpretation used by retrieval and planning.
 - A `workflow_node` records a tool/agent step in a generated edit plan, including dependencies, status, retries, and outputs.
 
 ### Retrieval
@@ -401,14 +408,26 @@ Example response:
 
 ```json
 {
-  "query": "funny moment where the shoot becomes chaotic",
-  "results": [
+  "query": "archive to live studio emotional payoff",
+  "packets": [
     {
       "segment_id": "seg_123",
+      "select_id": "select_123",
       "score": 0.91,
-      "reason": "Transcript mentions the failed setup, crew laughs, and visual analysis sees a lighting reset.",
-      "suggested_use": "midpoint escalation",
-      "quality_flags": []
+      "source_evidence": {
+        "summary": "The studio session reaches an emotional vocal peak.",
+        "context": "Within the corpus, this works as emotion/payoff material."
+      },
+      "why_matches": ["story-role fit: emotion, payoff"],
+      "why_belongs_before_after": "Belongs late, ideally after context or escalation.",
+      "relationship_expansion": [
+        {
+          "segment_id": "seg_122",
+          "relationship_type": "build_up",
+          "evidence": "Previous clip establishes the studio session."
+        }
+      ],
+      "warnings": ["check_audio_transition"]
     }
   ]
 }
@@ -434,12 +453,16 @@ Planner outputs:
 - Target duration.
 - Tone.
 - Audience assumptions.
+- Explicit/implicit directive intent analysis.
 - Beat list with duration ranges.
 - Retrieval queries for each beat.
 - Visual/storyboard queries for each beat.
 - Must-have constraints.
 - Nice-to-have constraints.
 - Ending criteria.
+- Candidate clips per beat and selected sequence.
+- Context-aware caption plan.
+- Transition notes and continuity warnings.
 - Workflow graph draft: which tools/agents are required and what each step must produce.
 
 ### Select Casting
@@ -501,6 +524,12 @@ Timeline JSON shape:
           "post_roll_sec": 0.4,
           "role": "hook",
           "reason": "Clear funny opening with immediate conflict.",
+          "why_here": "Hook beat: matches directive terms and establishes the subject.",
+          "before_context": "First impression; no prior setup required.",
+          "after_context": "Should lead into context rather than another similar hook.",
+          "caption_text": "Studio archive: the first spark",
+          "transition_note": "Open cleanly; establish the subject before adding context.",
+          "continuity_score": 0.82,
           "source_references": ["transcript_span_003", "observation_019"]
         }
       ]

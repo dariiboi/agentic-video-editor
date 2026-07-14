@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -301,6 +301,77 @@ def migrate(conn: sqlite3.Connection) -> None:
             source text not null,
             created_at text not null
         );
+
+        create table if not exists collection_summaries (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            source text not null,
+            summary_json text not null,
+            created_at text not null,
+            updated_at text not null,
+            unique(project_id, source)
+        );
+
+        create table if not exists material_bank_items (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            item_type text not null,
+            name text not null,
+            description text,
+            evidence_json text not null,
+            confidence real,
+            source text not null,
+            created_at text not null,
+            unique(project_id, item_type, name, source)
+        );
+
+        create table if not exists editorial_context_cards (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            segment_id text not null references segments(id) on delete cascade,
+            local_meaning text not null,
+            corpus_meaning text not null,
+            editorial_use text not null,
+            avoid_pairing_notes text,
+            relationship_notes text,
+            warnings_json text not null,
+            source text not null,
+            created_at text not null,
+            updated_at text not null,
+            unique(segment_id, source)
+        );
+
+        create table if not exists intent_analyses (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            directive_id text references directives(id) on delete set null,
+            directive_text text not null,
+            analysis_json text not null,
+            source text not null,
+            created_at text not null
+        );
+
+        create table if not exists caption_options (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            segment_id text not null references segments(id) on delete cascade,
+            context_card_id text references editorial_context_cards(id) on delete cascade,
+            caption_text text not null,
+            caption_type text not null,
+            confidence real,
+            source text not null,
+            created_at text not null
+        );
+
+        create table if not exists edit_plans (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            directive_id text references directives(id) on delete set null,
+            intent_analysis_id text references intent_analyses(id) on delete set null,
+            plan_json text not null,
+            source text not null,
+            created_at text not null
+        );
         """
     )
     conn.execute(
@@ -308,6 +379,12 @@ def migrate(conn: sqlite3.Connection) -> None:
         (SCHEMA_VERSION,),
     )
     _ensure_column(conn, "projects", "schema_version", "integer not null default 1")
+    _ensure_column(conn, "timeline_items", "why_here", "text")
+    _ensure_column(conn, "timeline_items", "before_context", "text")
+    _ensure_column(conn, "timeline_items", "after_context", "text")
+    _ensure_column(conn, "timeline_items", "caption_text", "text")
+    _ensure_column(conn, "timeline_items", "transition_note", "text")
+    _ensure_column(conn, "timeline_items", "continuity_score", "real")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

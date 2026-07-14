@@ -302,6 +302,36 @@ Critique highlights:
 - The ending needs a stronger musical resolution.
 - Suggested future patches include audio crossfades/bed, better ending selection, context overlays, and trimming early visual repetition.
 
+### Phase 6.5: Editorial Context Intelligence
+
+Status: implemented as the first context-aware backend pass.
+
+Commands added:
+
+- `ave context-build`
+- `ave context-summary`
+- `ave context-search`
+- `ave related`
+- `ave edit-plan`
+- `ave timeline --context-aware`
+
+New durable tables:
+
+- `collection_summaries`
+- `material_bank_items`
+- `editorial_context_cards`
+- `intent_analyses`
+- `caption_options`
+- `edit_plans`
+
+Implementation notes:
+
+- `context-build` materializes collection-level themes, visual styles, recurring terms, per-segment editorial context cards, avoid-pairing notes, warnings, and caption options.
+- `context-search` returns retrieval packets with source evidence, match reasons, relationship expansion, placement guidance, continuity compatibility, and warnings.
+- `edit-plan` separates intent/beat planning from timeline compilation and outputs explicit intent, beat sheet, candidate clips per beat, selected sequence, captions, transition notes, and continuity warnings.
+- `timeline --context-aware` preserves the existing simple timeline fallback while adding `why_here`, `before_context`, `after_context`, `caption_text`, `transition_note`, and `continuity_score` to planned timeline items.
+- The mock provider path is deterministic for tests; the Gemini provider can generate JSON text context from existing segment summaries without re-uploading video.
+
 ### Phase 7: Review UI
 
 Status: not started.
@@ -324,5 +354,5 @@ Command run:
 Result:
 
 ```text
-5 passed
+7 passed
 ```

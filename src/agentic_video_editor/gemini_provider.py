@@ -17,6 +17,32 @@ class GeminiProvider:
     model: str = DEFAULT_MODEL
     env_path: Path = Path(".gemini_api.env")
 
+    def generate_text_json(self, prompt: str) -> dict[str, Any]:
+        from google import genai
+        from google.genai import types
+
+        api_key = load_gemini_api_key(self.env_path)
+        client = genai.Client(api_key=api_key)
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=[prompt],
+                    config=types.GenerateContentConfig(
+                        temperature=0.2,
+                        responseMimeType="application/json",
+                        maxOutputTokens=8192,
+                    ),
+                )
+                return parse_json_response(response.text or "{}")
+            except Exception as exc:
+                last_error = exc
+                if not _is_retryable(exc) or attempt == 2:
+                    raise
+                time.sleep(5 * (attempt + 1))
+        raise RuntimeError("Gemini request failed") from last_error
+
     def generate_video_json(self, video_path: Path, prompt: str) -> dict[str, Any]:
         from google import genai
         from google.genai import types
@@ -49,6 +75,10 @@ class GeminiProvider:
 
 
 class MockProvider:
+    def generate_text_json(self, prompt: str) -> dict[str, Any]:
+        del prompt
+        return {}
+
     def generate_video_json(self, video_path: Path, prompt: str) -> dict[str, Any]:
         del prompt
         name = video_path.stem
