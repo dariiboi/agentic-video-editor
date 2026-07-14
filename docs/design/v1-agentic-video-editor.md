@@ -4,6 +4,7 @@ Last updated: July 13, 2026
 
 Companion audit: [third-party-repo-audit.md](third-party-repo-audit.md)
 Current execution status: [phase-execution-status.md](phase-execution-status.md)
+Next agentic editing handoff: [next-agentic-editing-handoff.md](next-agentic-editing-handoff.md)
 
 ## Product Thesis
 

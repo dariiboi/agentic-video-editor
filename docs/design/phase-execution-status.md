@@ -332,6 +332,12 @@ Implementation notes:
 - `timeline --context-aware` preserves the existing simple timeline fallback while adding `why_here`, `before_context`, `after_context`, `caption_text`, `transition_note`, and `continuity_score` to planned timeline items.
 - The mock provider path is deterministic for tests; the Gemini provider can generate JSON text context from existing segment summaries without re-uploading video.
 
+Known limitation exposed by the 4-minute word-story test:
+
+- The current system can create a constrained montage, but it does not yet author a real storyline.
+- A brief such as "create a 4 minute movie that features a small story created thru words, max shot length 5 seconds" needs a StoryAgent, word spine, causal beat planning, pre-render critique, and repair loop.
+- Handoff doc: [next-agentic-editing-handoff.md](next-agentic-editing-handoff.md).
+
 ### Phase 7: Review UI
 
 Status: not started.
