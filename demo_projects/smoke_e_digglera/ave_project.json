@@ -1,0 +1,11 @@
+{
+  "schema": "ave-project-v1",
+  "schema_version": 1,
+  "project_id": "default",
+  "name": "smoke_e_digglera",
+  "root": "/Users/dariusshaoul/Documents/agentic-video-editor/demo_projects/smoke_e_digglera",
+  "database": "library.sqlite",
+  "created_at": "2026-07-14T00:05:48+00:00",
+  "updated_at": "2026-07-14T00:05:48+00:00",
+  "ave_version": "0.1.0"
+}
