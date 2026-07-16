@@ -33,5 +33,7 @@ module to the tables it writes, and ends with sqlite inspection one-liners.
 
 See [docs/design/v1-agentic-video-editor.md](docs/design/v1-agentic-video-editor.md) for the V1 design.
 See [docs/design/phase-execution-status.md](docs/design/phase-execution-status.md) for the current phase status against the dummy footage.
+See [docs/design/generalized-directive-engine-handoff.md](docs/design/generalized-directive-engine-handoff.md) for the next build phase: arbitrary-directive handling with multi-facet ingest and ad-hoc narrative structures.
+See [docs/design/next-steps.md](docs/design/next-steps.md) for documentary-footage readiness and open gaps.
 
 Development note: the current standard-library CLI slice runs on the local Python available here, but the intended full video stack should target Python 3.11 or 3.12 because planned dependencies such as OpenTimelineIO and FiftyOne currently document support through Python 3.12.

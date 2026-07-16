@@ -2,6 +2,13 @@
 
 Last updated: July 15, 2026
 
+> **Superseded in part (July 16, 2026):** the StoryAgent/agent-flow sections of
+> this doc are superseded by
+> [generalized-directive-engine-handoff.md](generalized-directive-engine-handoff.md),
+> which generalizes fixed story arcs into directive-invented ad-hoc structures
+> and adds multi-facet ingest. The research findings, micro-timing layer, context
+> engineering, and acceptance-test ideas here still apply.
+
 > **Revision note (July 15, 2026):** The critique/revision loop (CriticAgent +
 > critique-driven RepairAgent passes) is dropped for now — LLM-scored review loops
 > are ungrounded and every OSS project we studied that used one got no measurable
