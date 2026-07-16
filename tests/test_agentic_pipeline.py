@@ -96,7 +96,58 @@ def test_mock_context_build_search_plan_and_context_timeline(tmp_path, run_ave):
     first_item = shown["tracks"][0]["items"][0]
     assert first_item["why_here"]
     assert "caption_text" in first_item
+    assert "cut_snap" in first_item
     assert shown["context_aware"] is True
+
+    render = _json(
+        run_ave("render", project_dir, "--timeline-id", "latest", "--burn-captions", "--json", timeout=120)
+    )
+    assert render["status"] == "complete"
+    assert Path(render["path"]).is_file()
+
+
+def test_render_with_crossfade_and_loudnorm(tmp_path, run_ave):
+    project_dir = tmp_path / "project"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    make_mp4(source_dir / "clip_a.mp4", seconds=3)
+    make_mp4(source_dir / "clip_b.mp4", seconds=3)
+
+    run_ave("init", project_dir)
+    run_ave("ingest", project_dir, source_dir)
+    run_ave("analyze", project_dir, "--window-sec", "1", "--json", timeout=60)
+    run_ave("cutpoints", project_dir, "--json", timeout=60)
+    run_ave("semantic-analyze", project_dir, "--provider", "mock", "--json")
+
+    timeline = _json(
+        run_ave(
+            "timeline",
+            project_dir,
+            "--directive",
+            "make a short performance montage",
+            "--duration-sec",
+            "4",
+            "--max-clip-sec",
+            "2",
+            "--json",
+        )
+    )
+    render = _json(
+        run_ave(
+            "render",
+            project_dir,
+            "--timeline-id",
+            "latest",
+            "--crossfade-sec",
+            "0.3",
+            "--json",
+            timeout=120,
+        )
+    )
+
+    assert timeline["items_created"] >= 2
+    assert render["status"] == "complete"
+    assert Path(render["path"]).is_file()
 
 
 def test_context_aware_timeline_falls_back_without_context_cards(tmp_path, run_ave):

@@ -168,6 +168,14 @@ def _load_search_segments(conn) -> list[dict[str, Any]]:
             segments.actions_json,
             segments.moods_json,
             segments.story_roles_json,
+            segments.word_units_json,
+            segments.story_function,
+            segments.setup_questions_json,
+            segments.payoff_answers_json,
+            segments.audio_affordance,
+            segments.visual_affordance,
+            segments.needs_caption,
+            segments.cut_notes,
             segments.quality_score,
             selects.id as select_id,
             selects.suggested_role,
@@ -230,9 +238,22 @@ def _load_relationships(conn) -> dict[str, list[dict[str, Any]]]:
 
 def _row(row) -> dict[str, Any]:
     item = dict(row)
-    for key in ["people_json", "actions_json", "moods_json", "story_roles_json", "warnings_json"]:
+    for key in [
+        "people_json",
+        "actions_json",
+        "moods_json",
+        "story_roles_json",
+        "warnings_json",
+        "setup_questions_json",
+        "payoff_answers_json",
+    ]:
         clean_key = key.replace("_json", "")
         item[clean_key] = _json_list(item.pop(key))
+    try:
+        word_units = json.loads(item.pop("word_units_json") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        word_units = []
+    item["word_units"] = word_units if isinstance(word_units, list) else []
     return item
 
 
@@ -315,6 +336,11 @@ def _packet(
             "transcript_summary": segment.get("transcript_summary"),
             "select_reason": segment.get("select_reason"),
             "context": segment.get("corpus_meaning"),
+            "word_units": segment.get("word_units") or [],
+            "story_function": segment.get("story_function"),
+            "audio_affordance": segment.get("audio_affordance"),
+            "visual_affordance": segment.get("visual_affordance"),
+            "cut_notes": segment.get("cut_notes"),
         },
         "why_matches": reasons or ["high-scoring candidate from semantic analysis"],
         "why_belongs_before_after": _placement_hint(segment),
@@ -383,6 +409,12 @@ def _haystack(segment: dict[str, Any]) -> str:
         segment.get("corpus_meaning"),
         segment.get("editorial_use"),
         segment.get("select_reason"),
+        segment.get("story_function"),
+        segment.get("audio_affordance"),
+        segment.get("visual_affordance"),
+        " ".join(str(unit.get("text") or "") for unit in segment.get("word_units") or [] if isinstance(unit, dict)),
+        " ".join(segment.get("setup_questions") or []),
+        " ".join(segment.get("payoff_answers") or []),
         " ".join(segment.get("story_roles") or []),
         " ".join(segment.get("actions") or []),
         " ".join(segment.get("moods") or []),

@@ -12,7 +12,9 @@ from .project import Project, utc_now
 
 
 TRANSCRIPT_PROMPT = """
-Analyze this video for an editing assistant. Return JSON only:
+You are producing the timestamped transcript log for a video editor. Editors will
+later cut the video by QUOTING your spans back, so each span must be something a
+cut can safely land on. Return JSON only:
 {
   "spans": [
     {
@@ -26,11 +28,19 @@ Analyze this video for an editing assistant. Return JSON only:
   ]
 }
 
-Rules:
-- Use approximate timestamps in seconds.
-- For spoken dialogue, short timestamped transcription is useful.
-- For copyrighted songs or lyrics, do not provide long verbatim lyric transcription; summarize themes and only include very short snippets when necessary.
-- Prefer 6-16 spans for a full video, enough to make search useful.
+Timing rules (most important):
+- start_sec is the instant the FIRST word or note of the span begins - not the
+  start of the surrounding scene. end_sec is when the LAST word or note finishes.
+- Break speech at natural phrase boundaries (breaths, sentence ends), never
+  mid-sentence. One complete utterance per span beats one long paragraph.
+- If speech is continuous, split it into spans of at most ~8 seconds at breath points.
+
+Content rules:
+- For spoken dialogue, transcribe short phrases verbatim so they are quotable.
+- For copyrighted songs, do not transcribe verses; give a 3-6 word identifying
+  snippet plus a theme summary, and mark kind as lyric_summary.
+- Note speaker changes; reuse consistent speaker labels across spans.
+- Prefer 6-16 spans for a full video; more only if the video is dialogue-dense.
 - Keep every text field concise and searchable.
 """
 

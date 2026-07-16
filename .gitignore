@@ -10,6 +10,7 @@ __pycache__/
 
 demo_projects/*/media/
 demo_projects/*/renders/
+demo_projects/*/qmd_cards/
 demo_projects/*/analysis/gemini_cache/
 demo_projects/*/analysis/runs/
 demo_projects/*/analysis/transcripts/

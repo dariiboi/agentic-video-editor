@@ -338,6 +338,79 @@ Known limitation exposed by the 4-minute word-story test:
 - A brief such as "create a 4 minute movie that features a small story created thru words, max shot length 5 seconds" needs a StoryAgent, word spine, causal beat planning, pre-render critique, and repair loop.
 - Handoff doc: [next-agentic-editing-handoff.md](next-agentic-editing-handoff.md).
 
+### Phase 6.6: Micro-Timing Layer
+
+Status: implemented (July 15, 2026).
+
+Commands added:
+
+- `ave cutpoints` / `ave cutpoints-summary` — shot changes (ffmpeg scene score) and audio gaps (silencedetect at phrase resolution) stored in `scene_boundaries`.
+- `ave timeline --snap-tolerance-sec` — timeline compilation snaps LLM-approximate trim points to detected cut points, with a 0.15s protective margin inside audio gaps; budget truncation pulls out-points back to the nearest clean cut.
+- `ave render --crossfade-sec / --burn-captions / --no-loudnorm` — micro audio fades at hard cuts, optional xfade+acrossfade transitions, drawtext caption burn-in with graceful fallback, and one loudness pass over the whole timeline instead of per clip.
+
+Prompt/context upgrades:
+
+- Semantic prompt rewritten with cut-hygiene timing rules and new fields: `word_units` (verbatim short quotes with tight timestamps), `story_function`, `setup_questions`, `payoff_answers`, `audio_affordance`, `visual_affordance`, `needs_caption`, `cut_notes`. Stored as new `segments` columns, FTS-indexed, and surfaced in retrieval packets.
+- Transcript prompt rewritten so spans start at word onsets and break at breath points, making them safely quotable as cut ranges.
+
+Dropped:
+
+- The LLM-scored critique/revision loop, per the July 15 decision. Constraint validation with mechanical repair remains the plan.
+
+### Phase 6.7: Local Word Alignment + qmd Relationship Mining
+
+Status: implemented (July 15, 2026).
+
+Commands added:
+
+- `ave align` / `ave align-summary` — local word-level ASR via faster-whisper
+  (already installed in the anaconda env; CT2 models download once, then fully
+  offline; default `small.en`, same weights family superwhisper uses). Stores
+  verbatim FTS-indexed `transcript_spans` (source `local_asr`), per-word timing in
+  the new `word_alignments` table, and pause-adjacent word boundaries as
+  `asr_word` cut points (`word_start` = clean in-point, `word_end` = clean
+  out-point) that the timeline snapper consumes. Note: superwhisper's own model
+  files (ggml/whisper.cpp + argmax CoreML) are format-incompatible with Python
+  tooling; faster-whisper is the equivalent local path.
+- `ave export-cards` — one markdown card per segment (summary, verbatim word
+  units, affordances, context card fields, overlapping verbatim ASR spans) into
+  `PROJECT/qmd_cards/` for qmd indexing.
+- `ave relate --collection NAME` — vector-searches each card via `qmd vsearch
+  --json`, writes typed segment relationships (`duplicates` >= 0.85 similarity,
+  `echoes` / `echoes_same_source` above `--min-score`) into the existing
+  `relationships` table, deduped per pair. Edges surface through `ave related`
+  and retrieval packet `relationship_expansion`.
+
+qmd workflow (one-time per project):
+
+```bash
+ave export-cards PROJECT
+qmd collection add PROJECT/qmd_cards --name ave-PROJECT
+qmd embed
+ave relate PROJECT --collection ave-PROJECT
+```
+
+Note: qmd slugifies file names (underscores become hyphens); the relate command
+matches ids through normalized slugs.
+
+### Phase 6.8: Per-Join Transition Agency
+
+Status: implemented (July 16, 2026).
+
+- Transitions are now decided per join at timeline compile time
+  (`timeline.py::_assign_transitions` / `_decide_transition`) from evidence on the
+  adjacent clips: same-source jump cuts get a dissolve, abrupt/missing audio gets a
+  short crossfade, music-to-music source changes blend, dialogue boundaries hard
+  cut. Each decision is stored as `timeline_items.transition_json` with a `why`.
+- The renderer executes the plan with a mixed filter chain
+  (`render.py::_joined_command`): xfade+acrossfade at fade joins, concat at cut
+  joins, `settb` normalization so the two can chain, micro audio fades only on
+  hard-cut sides. `--crossfade-sec` is demoted to a force-everything override.
+- Verified on the demo project: a talk-directive timeline produced mixed decisions
+  (2 cuts, 3 crossfades) and rendered cleanly.
+- Companion audit of remaining blanket creative decisions:
+  [blanket-creative-decisions-audit.md](blanket-creative-decisions-audit.md).
+
 ### Phase 7: Review UI
 
 Status: not started.

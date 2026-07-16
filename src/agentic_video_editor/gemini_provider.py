@@ -100,10 +100,20 @@ class MockProvider:
                     "kind": "candidate_moment",
                     "summary": f"Usable opening moment from {name}.",
                     "transcript_summary": "Short performance excerpt.",
+                    "word_units": [
+                        {"text": "mock opening line", "start_sec": 0.4, "end_sec": 2.1, "kind": "spoken"}
+                    ],
                     "people": [],
                     "actions": ["performing"],
                     "moods": ["musical"],
                     "story_roles": ["hook"],
+                    "story_function": "setup",
+                    "setup_questions": ["who is performing"],
+                    "payoff_answers": [],
+                    "audio_affordance": "music_bed",
+                    "visual_affordance": "performance",
+                    "needs_caption": False,
+                    "cut_notes": "in: downbeat at 0.0; out: phrase completes before 12.0",
                     "quality_score": 0.6,
                     "usable": True,
                     "select": {

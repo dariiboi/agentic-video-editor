@@ -5,13 +5,16 @@ import json
 import sys
 from pathlib import Path
 
+from .align import align_project, align_summary
 from .analyze import analyze_project, summarize_local_analysis
 from .context import build_editorial_context, context_summary
 from .critique import critique_render, review_summary
+from .cutpoints import cut_point_summary, detect_cut_points
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .planner import create_edit_plan
 from .project import init_project, load_project
+from .qmd_bridge import export_cards, relate_from_qmd
 from .render import render_summary, render_timeline
 from .retrieval import context_search, related_segments
 from .semantics import search_segments, semantic_analyze_project, semantic_summary
@@ -60,6 +63,33 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("--limit", type=int)
     analyze_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     analyze_parser.set_defaults(func=_analyze_command)
+
+    align_parser = subcommands.add_parser("align", help="Word-align speech locally (faster-whisper) into spans + cut points")
+    align_parser.add_argument("project_dir", type=Path)
+    align_parser.add_argument("--model", default="small.en", help="faster-whisper model size (tiny.en, base.en, small.en, ...)")
+    align_parser.add_argument("--limit", type=int)
+    align_parser.add_argument("--force", action="store_true", help="Re-align assets that already have local ASR spans")
+    align_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    align_parser.set_defaults(func=_align_command)
+
+    align_summary_parser = subcommands.add_parser("align-summary", help="Summarize local ASR alignment")
+    align_summary_parser.add_argument("project_dir", type=Path)
+    align_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    align_summary_parser.set_defaults(func=_align_summary_command)
+
+    cutpoints_parser = subcommands.add_parser("cutpoints", help="Detect frame-accurate cut points (shot changes + audio gaps)")
+    cutpoints_parser.add_argument("project_dir", type=Path)
+    cutpoints_parser.add_argument("--scene-threshold", type=float, default=0.3)
+    cutpoints_parser.add_argument("--gap-noise-db", type=float, default=-30.0)
+    cutpoints_parser.add_argument("--gap-min-sec", type=float, default=0.12)
+    cutpoints_parser.add_argument("--limit", type=int)
+    cutpoints_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    cutpoints_parser.set_defaults(func=_cutpoints_command)
+
+    cutpoints_summary_parser = subcommands.add_parser("cutpoints-summary", help="Summarize detected cut points")
+    cutpoints_summary_parser.add_argument("project_dir", type=Path)
+    cutpoints_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    cutpoints_summary_parser.set_defaults(func=_cutpoints_summary_command)
 
     summary_parser = subcommands.add_parser("analysis-summary", help="Summarize local analysis")
     summary_parser.add_argument("project_dir", type=Path)
@@ -130,6 +160,20 @@ def build_parser() -> argparse.ArgumentParser:
     context_search_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     context_search_parser.set_defaults(func=_context_search_command)
 
+    export_cards_parser = subcommands.add_parser("export-cards", help="Export per-segment markdown cards for qmd indexing")
+    export_cards_parser.add_argument("project_dir", type=Path)
+    export_cards_parser.add_argument("--out-dir", type=Path, help="Override the default PROJECT/qmd_cards directory")
+    export_cards_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    export_cards_parser.set_defaults(func=_export_cards_command)
+
+    relate_parser = subcommands.add_parser("relate", help="Mine cross-clip relationships via qmd vector search")
+    relate_parser.add_argument("project_dir", type=Path)
+    relate_parser.add_argument("--collection", required=True, help="qmd collection name that indexes the exported cards")
+    relate_parser.add_argument("--top-k", type=int, default=8)
+    relate_parser.add_argument("--min-score", type=float, default=0.6)
+    relate_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    relate_parser.set_defaults(func=_relate_command)
+
     related_parser = subcommands.add_parser("related", help="Show related segments")
     related_parser.add_argument("project_dir", type=Path)
     related_parser.add_argument("segment_id")
@@ -151,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_parser.add_argument("--query")
     timeline_parser.add_argument("--max-clip-sec", type=float, default=12.0)
     timeline_parser.add_argument("--context-aware", action="store_true", help="Use editorial context planning")
+    timeline_parser.add_argument(
+        "--snap-tolerance-sec",
+        type=float,
+        default=1.0,
+        help="Snap trim points to detected cut points within this window (0 disables)",
+    )
     timeline_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     timeline_parser.set_defaults(func=_timeline_command)
 
@@ -164,6 +214,14 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser = subcommands.add_parser("render", help="Render a timeline to MP4")
     render_parser.add_argument("project_dir", type=Path)
     render_parser.add_argument("--timeline-id", default="latest")
+    render_parser.add_argument(
+        "--crossfade-sec",
+        type=float,
+        default=0.0,
+        help="Force a crossfade on every join, overriding the timeline's per-join transition decisions",
+    )
+    render_parser.add_argument("--burn-captions", action="store_true", help="Burn caption_text into the video")
+    render_parser.add_argument("--no-loudnorm", action="store_true", help="Skip the final loudness-normalization pass")
     render_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     render_parser.set_defaults(func=_render_command)
 
@@ -285,6 +343,55 @@ def _analysis_summary_command(args: argparse.Namespace) -> int:
     print("Artifacts:")
     for artifact_type, count in summary["artifacts"].items():
         print(f"  {artifact_type}: {count}")
+    return 0
+
+
+def _align_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = align_project(
+        project,
+        model_size=args.model,
+        limit=args.limit,
+        force=args.force,
+    )
+    data = {
+        "assets_requested": summary.assets_requested,
+        "assets_completed": summary.assets_completed,
+        "spans_created": summary.spans_created,
+        "words_created": summary.words_created,
+        "cut_points_created": summary.cut_points_created,
+    }
+    return _print_json_or_lines(args.json, data, "Align")
+
+
+def _align_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = align_summary(project)
+    return _print_json_or_lines(args.json, data, "Align summary")
+
+
+def _cutpoints_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = detect_cut_points(
+        project,
+        scene_threshold=args.scene_threshold,
+        gap_noise_db=args.gap_noise_db,
+        gap_min_sec=args.gap_min_sec,
+        limit=args.limit,
+    )
+    data = {
+        "assets_requested": summary.assets_requested,
+        "assets_completed": summary.assets_completed,
+        "scene_points": summary.scene_points,
+        "audio_gap_points": summary.audio_gap_points,
+    }
+    return _print_json_or_lines(args.json, data, "Cut points")
+
+
+def _cutpoints_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = cut_point_summary(project)
+    print(json.dumps(data, indent=2))
     return 0
 
 
@@ -415,6 +522,28 @@ def _context_search_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _export_cards_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = export_cards(project, out_dir=args.out_dir)
+    data = {"cards_written": summary.cards_written, "cards_dir": summary.cards_dir}
+    return _print_json_or_lines(args.json, data, "Export cards")
+
+
+def _relate_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = relate_from_qmd(
+        project,
+        collection=args.collection,
+        top_k=args.top_k,
+        min_score=args.min_score,
+    )
+    data = {
+        "segments_queried": summary.segments_queried,
+        "relationships_created": summary.relationships_created,
+    }
+    return _print_json_or_lines(args.json, data, "Relate")
+
+
 def _related_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
     data = related_segments(project, args.segment_id, limit=args.limit)
@@ -447,6 +576,7 @@ def _timeline_command(args: argparse.Namespace) -> int:
         query=args.query,
         max_clip_sec=args.max_clip_sec,
         context_aware=args.context_aware,
+        snap_tolerance_sec=args.snap_tolerance_sec,
     )
     data = {
         "timeline_id": summary.timeline_id,
@@ -469,7 +599,13 @@ def _timelines_command(args: argparse.Namespace) -> int:
 
 def _render_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
-    summary = render_timeline(project, timeline_id=args.timeline_id)
+    summary = render_timeline(
+        project,
+        timeline_id=args.timeline_id,
+        crossfade_sec=args.crossfade_sec,
+        burn_captions=args.burn_captions,
+        normalize_loudness=not args.no_loudnorm,
+    )
     data = {
         "render_id": summary.render_id,
         "timeline_id": summary.timeline_id,

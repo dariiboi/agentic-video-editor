@@ -4,7 +4,7 @@ import sqlite3
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def connect_db(path: Path) -> sqlite3.Connection:
@@ -363,6 +363,22 @@ def migrate(conn: sqlite3.Connection) -> None:
             created_at text not null
         );
 
+        create table if not exists word_alignments (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            asset_id text not null references assets(id) on delete cascade,
+            span_id text references transcript_spans(id) on delete cascade,
+            start_sec real not null,
+            end_sec real not null,
+            text text not null,
+            confidence real,
+            source text not null,
+            created_at text not null
+        );
+
+        create index if not exists idx_word_alignments_asset_time
+            on word_alignments(asset_id, start_sec, end_sec);
+
         create table if not exists edit_plans (
             id text primary key,
             project_id text not null references projects(id) on delete cascade,
@@ -385,6 +401,15 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "timeline_items", "caption_text", "text")
     _ensure_column(conn, "timeline_items", "transition_note", "text")
     _ensure_column(conn, "timeline_items", "continuity_score", "real")
+    _ensure_column(conn, "timeline_items", "transition_json", "text")
+    _ensure_column(conn, "segments", "word_units_json", "text")
+    _ensure_column(conn, "segments", "story_function", "text")
+    _ensure_column(conn, "segments", "setup_questions_json", "text")
+    _ensure_column(conn, "segments", "payoff_answers_json", "text")
+    _ensure_column(conn, "segments", "audio_affordance", "text")
+    _ensure_column(conn, "segments", "visual_affordance", "text")
+    _ensure_column(conn, "segments", "needs_caption", "integer")
+    _ensure_column(conn, "segments", "cut_notes", "text")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

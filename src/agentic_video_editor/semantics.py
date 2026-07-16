@@ -13,7 +13,9 @@ from .transcript import _fts_query
 
 
 SEMANTIC_PROMPT = """
-Analyze this video for an autonomous video editor. Return JSON only:
+You are the logging department of a professional edit suite. Your notes are the ONLY
+thing the editor will ever know about this footage: if a signal is not written down
+here, the editor cannot cut on it. Watch the whole video, then return JSON only:
 {
   "segments": [
     {
@@ -22,12 +24,22 @@ Analyze this video for an autonomous video editor. Return JSON only:
       "kind": "candidate_moment",
       "summary": string,
       "transcript_summary": string,
+      "word_units": [
+        {"text": string, "start_sec": number, "end_sec": number, "kind": "spoken" | "sung" | "on_screen_text"}
+      ],
       "people": [string],
       "actions": [string],
       "moods": [string],
       "story_roles": [string],
+      "story_function": "thesis" | "setup" | "complication" | "turn" | "proof" | "reflection" | "payoff",
+      "setup_questions": [string],
+      "payoff_answers": [string],
+      "audio_affordance": "clean_dialogue" | "music_bed" | "abrupt_song_change" | "silence" | "noisy",
+      "visual_affordance": "close_up" | "wide" | "reaction" | "process_detail" | "performance" | "archive",
+      "needs_caption": boolean,
       "quality_score": number,
       "usable": boolean,
+      "cut_notes": string,
       "select": {
         "suggested_role": string,
         "score": number,
@@ -41,19 +53,33 @@ Analyze this video for an autonomous video editor. Return JSON only:
     {
       "from_index": number,
       "to_index": number,
-      "relationship_type": string,
+      "relationship_type": "sets_up" | "answers" | "contradicts" | "echoes" | "escalates" | "resolves" | "duplicates" | "requires_context",
       "confidence": number,
       "evidence": string
     }
   ]
 }
 
-Rules:
-- Use approximate timestamps in seconds.
-- Pick 4-8 editorially meaningful moments.
-- Do not transcribe long song lyrics verbatim; summarize musical/lyrical themes.
-- Include story roles such as hook, context, performance, process, emotion, payoff, archive, reaction, beauty_shot.
-- Prefer moments that could help build a short documentary/performance montage.
+Timing rules (most important):
+- trim_start_sec must be a clean entry point: a breath before a phrase, a settled
+  camera after a move, or a musical downbeat. Never start mid-word or mid-gesture.
+- trim_end_sec must let the phrase, note, or gesture COMPLETE before the cut.
+- Prefer moments whose in/out points sit next to pauses or shot changes, so they
+  survive a ±0.5s timing error. State in cut_notes exactly what the in-point and
+  out-point land on (e.g. "in: breath before 'I only know'; out: end of guitar phrase").
+- word_units are short verbatim spoken phrases or on-screen text with their own tight
+  timestamps; start_sec is when the FIRST word begins. For copyrighted lyrics, give a
+  3-6 word identifying snippet plus theme, never full verses.
+
+Editorial rules:
+- Pick 4-8 editorially meaningful moments; skip filler even if that means fewer.
+- summary must state what a viewer SEES and HEARS, not an interpretation of it.
+- setup_questions: questions a viewer would ask after seeing this clip.
+- payoff_answers: questions from elsewhere in the footage this clip answers.
+- story_roles: hook, context, performance, process, emotion, payoff, archive, reaction, beauty_shot.
+- Every relationship needs concrete evidence quoting what links the two moments.
+- quality_score and select.score are 0-1; reserve scores above 0.8 for moments you
+  would fight to keep in the final cut.
 """
 
 
@@ -220,15 +246,21 @@ def _store_semantics(
             actions = _list(raw.get("actions"))
             moods = _list(raw.get("moods"))
             story_roles = _list(raw.get("story_roles"))
+            word_units = _word_units(raw.get("word_units"), start, end)
+            setup_questions = _list(raw.get("setup_questions"))
+            payoff_answers = _list(raw.get("payoff_answers"))
             conn.execute(
                 """
                 insert into segments (
                     id, project_id, asset_id, start_sec, end_sec, kind,
                     summary, transcript_summary, people_json, actions_json,
                     moods_json, story_roles_json, quality_score, usable,
-                    source, source_run_id, created_at
+                    source, source_run_id, created_at,
+                    word_units_json, story_function, setup_questions_json,
+                    payoff_answers_json, audio_affordance, visual_affordance,
+                    needs_caption, cut_notes
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     segment_id,
@@ -248,16 +280,28 @@ def _store_semantics(
                     source,
                     None,
                     utc_now(),
+                    json.dumps(word_units),
+                    _text_or_none(raw.get("story_function")),
+                    json.dumps(setup_questions),
+                    json.dumps(payoff_answers),
+                    _text_or_none(raw.get("audio_affordance")),
+                    _text_or_none(raw.get("visual_affordance")),
+                    1 if raw.get("needs_caption") else 0,
+                    _text_or_none(raw.get("cut_notes")),
                 ),
             )
             fts_text = " ".join(
                 [
                     summary,
                     transcript_summary or "",
+                    " ".join(unit["text"] for unit in word_units),
                     " ".join(people),
                     " ".join(actions),
                     " ".join(moods),
                     " ".join(story_roles),
+                    " ".join(setup_questions),
+                    " ".join(payoff_answers),
+                    str(raw.get("story_function") or ""),
                 ]
             )
             conn.execute(
@@ -344,6 +388,34 @@ def _segment_row(row) -> dict[str, Any]:
     except json.JSONDecodeError:
         data["story_roles"] = []
     return data
+
+
+def _word_units(value: Any, segment_start: float, segment_end: float) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    units: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or "").strip()
+        if not text:
+            continue
+        start = _float(raw.get("start_sec"), segment_start)
+        end = _float(raw.get("end_sec"), segment_end)
+        units.append(
+            {
+                "text": text,
+                "start_sec": max(0.0, start if start is not None else segment_start),
+                "end_sec": max(0.0, end if end is not None else segment_end),
+                "kind": str(raw.get("kind") or "spoken"),
+            }
+        )
+    return units
+
+
+def _text_or_none(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text or None
 
 
 def _list(value: Any) -> list[str]:

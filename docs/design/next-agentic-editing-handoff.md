@@ -1,6 +1,13 @@
 # Next Agentic Editing Handoff
 
-Last updated: July 14, 2026
+Last updated: July 15, 2026
+
+> **Revision note (July 15, 2026):** The critique/revision loop (CriticAgent +
+> critique-driven RepairAgent passes) is dropped for now — LLM-scored review loops
+> are ungrounded and every OSS project we studied that used one got no measurable
+> quality from it. Constraint validation with automatic repair stays. In its place,
+> a micro-timing layer (cut-point detection, snap-on-compile, renderer polish) is
+> now implemented; see "Micro-Timing Layer" and "External Research Findings" below.
 
 ## Why This Exists
 
@@ -65,9 +72,9 @@ What it did not do:
    - As a user, I want a portrait that reveals personality through behavior, words, reactions, and performance.
    - Success means the system tracks character traits and chooses clips that add new information.
 
-9. **Make A Revision From Critique**
+9. **Make A Revision From Critique** *(deferred — critique loop dropped July 15, 2026)*
    - As a user, I want the agent to watch or inspect its own render, identify weak structure, and produce a revised timeline.
-   - Success means critique creates executable timeline patches, not just prose feedback.
+   - Deferred until critique can be grounded in measurable signals (duration match, audio-level discontinuities at cuts) rather than ungrounded LLM scores.
 
 10. **Respect Hard Format Constraints**
     - As a user, I want a fixed duration, max shot length, required caption density, and no off-brief clip types.
@@ -85,12 +92,9 @@ directive
   -> RetrievalAgent
   -> CastingAgent
   -> SequenceAgent
-  -> ConstraintAgent
-  -> CriticAgent
-  -> RepairAgent
-  -> timeline compiler
+  -> ConstraintAgent (validate + auto-repair)
+  -> timeline compiler (snaps to detected cut points)
   -> render
-  -> render critique
 ```
 
 ### 1. IntentAgent
@@ -276,39 +280,11 @@ Checks:
 - No invalid source timestamps.
 - Enough ending duration to land the payoff.
 
-It should return repair actions, not just warnings.
-
-### 8. CriticAgent
-
-Critique must happen before render and after render.
-
-Pre-render critique:
-
-- Does the plan satisfy the directive?
-- Is there a story or only a montage?
-- Which beat is weakest?
-- Which selected clip should be replaced?
-- Are constraints satisfied?
-
-Post-render critique:
-
-- Did the render duration match?
-- Are transitions too abrupt?
-- Did audio continuity break the story?
-- Did captions/text appear if required?
-- Did the ending feel like an ending?
-
-### 9. RepairAgent
-
-The RepairAgent applies targeted fixes:
-
-- Replace weak beat.
-- Swap duplicate source.
-- Move payoff later.
-- Add missing context card.
-- Add caption/title card.
-- Shorten or lengthen timeline.
-- Insert audio transition instruction.
+It should return repair actions, not just warnings. Repairs are mechanical and
+verifiable — swap a duplicate source, shorten an over-budget clip to the nearest
+cut point, replace an empty beat with the top alternate — and each repair is
+re-validated by the same constraint checks. There is deliberately no LLM-scored
+critique/revision loop in this iteration (see revision note at top).
 
 ## Context Engineering Needed
 
@@ -396,15 +372,6 @@ beat_candidates
   selected
   created_at
 
-plan_critiques
-  id
-  project_id
-  edit_plan_id
-  critique_json
-  patch_json
-  source
-  created_at
-
 timeline_constraint_reports
   id
   project_id
@@ -424,8 +391,16 @@ ave cast-beats PROJECT --story-plan-id ID --json
 ave sequence-plan PROJECT --story-plan-id ID --json
 ave validate-plan PROJECT --edit-plan-id ID --json
 ave repair-plan PROJECT --edit-plan-id ID --json
-ave render-critique PROJECT --render-id latest --json
 ave edit PROJECT --directive TEXT --duration-sec N --max-shot-sec N --json
+```
+
+Already shipped (July 15, 2026):
+
+```bash
+ave cutpoints PROJECT --json            # shot changes + audio gaps -> scene_boundaries
+ave cutpoints-summary PROJECT --json
+ave timeline PROJECT ... --snap-tolerance-sec 1.0
+ave render PROJECT --crossfade-sec 0.3 --burn-captions [--no-loudnorm]
 ```
 
 `ave edit` should orchestrate the full loop. Lower-level commands should remain available for testing and inspection.
@@ -453,42 +428,93 @@ while report.has_repairable_failures and run.repair_count < max_repairs:
     sequence = apply_patch(sequence, patch)
     report = validate_constraints(sequence, constraints)
 
-critique = critique_plan(sequence, story, intent)
-
-while critique.score < threshold and run.revision_count < max_revisions:
-    patch = propose_story_repairs(critique, sequence, story)
-    sequence = apply_patch(sequence, patch)
-    critique = critique_plan(sequence, story, intent)
-
-timeline = compile_timeline(sequence)
+timeline = compile_timeline(sequence)   # snaps every in/out to detected cut points
 render = render_timeline(timeline)
-render_review = critique_render(render, intent, story)
 ```
 
 ## Acceptance Tests For The Next Iteration
 
 1. A word-story brief produces a `story_blueprint` with logline, dramatic question, beginning/middle/end, and word spine.
 2. A 4-minute max-5-second brief produces 48 timeline items, no item over 5 seconds, and an explicit constraint report.
-3. The plan critique can flag "this is only a montage, not a story" before render.
-4. The repair loop can replace at least one weak beat automatically.
-5. Adjacent duplicate source usage is either avoided or explicitly justified.
-6. A mini-documentary brief uses context/process before payoff.
-7. A trailer brief uses trailer-specific beats rather than documentary beats.
-8. A character-portrait brief includes at least three different trait revelations.
-9. A render critique can identify abrupt audio transitions and create patch suggestions.
-10. Every final timeline item has a `why_here` that references the story beat, not only search terms.
+3. The constraint repair loop can replace at least one weak or duplicate beat automatically.
+4. Adjacent duplicate source usage is either avoided or explicitly justified.
+5. A mini-documentary brief uses context/process before payoff.
+6. A trailer brief uses trailer-specific beats rather than documentary beats.
+7. A character-portrait brief includes at least three different trait revelations.
+8. Every final timeline item has a `why_here` that references the story beat, not only search terms.
+9. Every timeline item whose source range was truncated to fit the duration budget ends on a detected cut point (shot change or audio gap) when one exists within tolerance.
+10. A rendered timeline with music across cuts shows no per-cut loudness jumps (single loudness pass, micro fades or crossfades at joins).
+
+## Micro-Timing Layer (implemented July 15, 2026)
+
+Story intelligence cannot feel natural if cuts land mid-word. This layer does the
+precision work locally and reserves the LLM for selection:
+
+- `cutpoints.py`: per-asset shot changes (ffmpeg scene score) and audio gaps
+  (silencedetect at phrase resolution) stored in `scene_boundaries`.
+- Timeline compiler snaps every LLM-approximate in/out point to the nearest cut
+  point within `--snap-tolerance-sec`, with a 0.15s protective margin inside audio
+  gaps (auto-editor's margin trick) so word attacks and decays survive.
+- Budget truncation is content-aware: a clip shortened to fit the duration target
+  pulls its out-point back to the nearest clean cut instead of chopping arbitrarily.
+- Renderer: micro audio fades (50ms) at every hard cut, optional `--crossfade-sec`
+  (xfade + acrossfade), optional `--burn-captions` (drawtext with graceful fallback),
+  and one loudness pass over the whole timeline instead of per clip.
+- Semantic/transcript prompts rewritten: cut-hygiene timing rules, verbatim
+  `word_units` with tight timestamps, `story_function`, `setup_questions` /
+  `payoff_answers`, audio/visual affordances, and `cut_notes` stating what each
+  in/out point lands on. All new fields are stored, FTS-indexed, and surfaced in
+  retrieval packets.
+
+## External Research Findings (July 15, 2026)
+
+From a survey of FunClip, LAVE (Meta IUI 2024), auto-editor, videogrep,
+HKUDS/VideoAgent, poseljacob/agentic-video-editor, and video-db/Director:
+
+1. **Never ask the LLM to invent timestamps.** FunClip's core pattern: give the
+   model a timestamped transcript and make it QUOTE spans back in a rigid format.
+   Adopt for all planner prompts: present segments as
+   `[seg_042 | 12.40-15.92 | "text..."]` and require answers that reference IDs.
+2. **Word-level timestamps gate the best features.** videogrep's phrase-level
+   supercuts only work with word timing (Vosk / whisperX forced alignment). This is
+   the next data investment: local ASR word alignment for speech-bearing ranges.
+3. **Margin + merge post-processing** (auto-editor): pad kept regions ~0.2s,
+   merge spans closer than ~0.5s. Margin is implemented; merge is TODO in the
+   SequenceAgent.
+4. **Dedicated TrimRefiner pass** (poseljacob): after casting, a second cheap LLM
+   pass per clip that only tightens in/out points, separate from clip selection.
+5. **Embedding retrieval over narrations** (LAVE): embed segment summaries +
+   transcripts to break the lexical ceiling; cosine ranking in SQLite is enough.
+6. **The LLM can only cut on what is serialized.** LAVE's key failure: trims fail
+   when users reference properties absent from captions. Energy/motion/framing must
+   be written into context cards, not hoped for.
+7. **Energy-adaptive pacing** (BeatSync-Engine): hold shots longer in calm music
+   sections, cut faster at drops — maps onto duration assignment in the sequencer.
+8. Dead ends: LLM-scored review loops as quality gates (ungrounded), ShortGPT-style
+   generate-from-script pipelines (not editors), cloud-locked stacks (Director).
 
 ## First Implementation Slice
 
 Recommended order:
 
-1. Add `story_blueprints`, `story_beats`, `beat_candidates`, `plan_critiques`, and `timeline_constraint_reports`.
-2. Implement `story.py` with deterministic mock StoryAgent and optional Gemini StoryAgent.
-3. Implement `constraints.py` for duration, shot length, duplicate, source validity, and required beat checks.
-4. Replace `planner.py` beat generation with StoryAgent-generated beats.
-5. Add pre-render plan critique with a simple rubric.
-6. Add one repair loop that can replace duplicate or weak beats.
-7. Add tests for the 10 user stories above using mock providers.
+1. ~~Micro-timing layer~~ — done (see above).
+2. ~~Word-level ASR alignment feeding word-boundary cut points~~ — done July 15,
+   2026 (`ave align`, faster-whisper, `word_alignments` table, `asr_word` snap
+   targets).
+3. ~~Embedding-based cross-clip relationship mining~~ — done July 15, 2026
+   (`ave export-cards` + `ave relate` via qmd vector search; typed
+   duplicates/echoes edges in `relationships`).
+4. Add `story_blueprints`, `story_beats`, `beat_candidates`, and `timeline_constraint_reports`.
+5. Implement `story.py` with deterministic mock StoryAgent and optional Gemini StoryAgent.
+   The StoryAgent prompt should quote verbatim `transcript_spans` (source
+   `local_asr`) and `word_units` with their timestamps — the quote-spans-back
+   pattern — never invent times.
+6. Implement `constraints.py` for duration, shot length, duplicate, source validity, and required beat checks.
+7. Replace `planner.py` beat generation with StoryAgent-generated beats; use qmd
+   `query` (hybrid BM25+vector+rerank) as the candidate generator behind
+   QueryAgent sub-queries, with sqlite as the source of truth.
+8. Add one constraint-repair loop that can replace duplicate or weak beats.
+9. Add tests for the 10 user stories above using mock providers.
 
 ## Important Principle
 

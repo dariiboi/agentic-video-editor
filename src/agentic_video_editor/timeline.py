@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from .cutpoints import load_cut_points, snap_range
 from .db import connect_db, migrate
 from .planner import create_edit_plan
 from .project import Project, utc_now
@@ -26,6 +27,7 @@ def create_timeline(
     query: str | None = None,
     max_clip_sec: float = 12.0,
     context_aware: bool = False,
+    snap_tolerance_sec: float = 1.0,
 ) -> TimelineSummary:
     directive_id = f"directive_{uuid.uuid4().hex[:16]}"
     timeline_id = f"timeline_{uuid.uuid4().hex[:16]}"
@@ -53,18 +55,25 @@ def create_timeline(
             if not candidates:
                 candidates = _fallback_items(conn)
 
+        cut_points_by_asset: dict[str, list[dict[str, Any]]] = {}
         for candidate in candidates:
             if timeline_cursor >= duration_sec:
                 break
+            cut_points = _asset_cut_points(conn, candidate["asset_id"], cut_points_by_asset)
+            if snap_tolerance_sec > 0:
+                _snap_candidate(candidate, cut_points, snap_tolerance_sec)
             item, clip_duration = _timeline_item_from_candidate(
                 candidate,
                 timeline_cursor=timeline_cursor,
                 duration_sec=duration_sec,
                 max_clip_sec=max_clip_sec,
+                cut_points=cut_points,
+                snap_tolerance_sec=snap_tolerance_sec,
             )
             items.append(item)
             timeline_cursor += clip_duration
 
+        _assign_transitions(items)
         timeline_json = {
             "timeline_id": timeline_id,
             "directive_id": directive_id,
@@ -102,9 +111,9 @@ def create_timeline(
                     segment_id, source_start_sec, source_end_sec, timeline_start_sec,
                     timeline_end_sec, role, reason, why_here, before_context,
                     after_context, caption_text, transition_note, continuity_score,
-                    created_at
+                    transition_json, created_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -126,6 +135,7 @@ def create_timeline(
                     item.get("caption_text"),
                     item.get("transition_note"),
                     item.get("continuity_score"),
+                    json.dumps(item.get("transition")) if item.get("transition") else None,
                     now,
                 ),
             )
@@ -238,6 +248,8 @@ def _planned_items(conn, sequence: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "caption_text": item.get("caption_text"),
                 "transition_note": item["transition_note"],
                 "continuity_score": item.get("continuity_score"),
+                "warnings": item.get("warnings") or [],
+                "audio_affordance": item.get("source_evidence", {}).get("audio_affordance"),
             }
         )
     return candidates
@@ -249,6 +261,8 @@ def _timeline_item_from_candidate(
     timeline_cursor: float,
     duration_sec: float,
     max_clip_sec: float,
+    cut_points: list[dict[str, Any]] | None = None,
+    snap_tolerance_sec: float = 0.0,
 ) -> tuple[dict[str, Any], float]:
     source_start = float(candidate["trim_start_sec"] or candidate["start_sec"])
     source_end = float(candidate["trim_end_sec"] or candidate["end_sec"])
@@ -258,7 +272,19 @@ def _timeline_item_from_candidate(
         source_start = min(source_start, max(0.0, asset_duration - 0.1))
         source_end = min(max(source_start + 0.1, source_end), asset_duration)
     clip_duration = max(0.1, min(max_clip_sec, source_end - source_start, duration_sec - timeline_cursor))
+    truncated = clip_duration < (source_end - source_start) - 0.01
     source_end = source_start + clip_duration
+    if truncated and cut_points and snap_tolerance_sec > 0:
+        snapped_end = _shrink_to_cut_point(
+            cut_points,
+            source_start,
+            source_end,
+            tolerance_sec=snap_tolerance_sec,
+        )
+        if snapped_end is not None:
+            source_end = snapped_end
+            clip_duration = source_end - source_start
+            candidate["cut_snap_end"] = "truncation_snapped"
     item = {
         "id": f"item_{uuid.uuid4().hex[:16]}",
         "asset_id": candidate["asset_id"],
@@ -275,9 +301,108 @@ def _timeline_item_from_candidate(
         "caption_text": candidate.get("caption_text"),
         "transition_note": candidate.get("transition_note"),
         "continuity_score": candidate.get("continuity_score"),
+        "cut_snap": candidate.get("cut_snap"),
+        "cut_snap_end": candidate.get("cut_snap_end"),
+        "warnings": candidate.get("warnings") or [],
+        "audio_affordance": candidate.get("audio_affordance"),
     }
     item.update(_rational_time_fields(item, float(candidate["fps"] or 30.0)))
     return item, clip_duration
+
+
+def _assign_transitions(items: list[dict[str, Any]]) -> None:
+    """Decide per-join transitions from the evidence on each clip.
+
+    The renderer executes these; a global --crossfade-sec flag only overrides.
+    """
+    for index, item in enumerate(items):
+        if index == 0:
+            item["transition"] = {"type": "cut", "why": "opening clip; establish the subject cleanly"}
+        else:
+            item["transition"] = _decide_transition(items[index - 1], item)
+
+
+MUSIC_AFFORDANCES = {"music_bed", "abrupt_song_change"}
+
+
+def _decide_transition(previous: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    warnings = set(current.get("warnings") or []) | set(previous.get("warnings") or [])
+    prev_audio = previous.get("audio_affordance")
+    cur_audio = current.get("audio_affordance")
+
+    if previous["asset_id"] == current["asset_id"]:
+        return {
+            "type": "crossfade",
+            "duration_sec": 0.35,
+            "why": "same-source jump cut; a short dissolve hides the time skip",
+        }
+    if "abrupt_audio_or_no_audio" in warnings:
+        return {
+            "type": "crossfade",
+            "duration_sec": 0.3,
+            "why": "audio bed drops or appears abruptly across the join",
+        }
+    if prev_audio in MUSIC_AFFORDANCES and cur_audio in MUSIC_AFFORDANCES:
+        return {
+            "type": "crossfade",
+            "duration_sec": 0.4,
+            "why": "music-to-music source change; blend the beds",
+        }
+    if "check_audio_transition" in warnings and cur_audio != "clean_dialogue":
+        return {
+            "type": "crossfade",
+            "duration_sec": 0.4,
+            "why": "flagged audio transition risk into a non-dialogue clip",
+        }
+    if cur_audio == "clean_dialogue" or prev_audio == "clean_dialogue":
+        return {"type": "cut", "why": "dialogue boundary; hard cut keeps words crisp"}
+    return {"type": "cut", "why": "no audio risk detected; hard cut preserves energy"}
+
+
+def _asset_cut_points(
+    conn,
+    asset_id: str,
+    cache: dict[str, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    if asset_id not in cache:
+        cache[asset_id] = load_cut_points(conn, asset_id)
+    return cache[asset_id]
+
+
+def _snap_candidate(
+    candidate: dict[str, Any],
+    cut_points: list[dict[str, Any]],
+    tolerance_sec: float,
+) -> None:
+    if not cut_points:
+        return
+    start = float(candidate["trim_start_sec"] or candidate["start_sec"])
+    end = float(candidate["trim_end_sec"] or candidate["end_sec"])
+    snap = snap_range(cut_points, start, end, tolerance_sec=tolerance_sec)
+    if snap["start_snapped_to"] or snap["end_snapped_to"]:
+        candidate["trim_start_sec"] = snap["start_sec"]
+        candidate["trim_end_sec"] = snap["end_sec"]
+        candidate["cut_snap"] = snap
+
+
+def _shrink_to_cut_point(
+    cut_points: list[dict[str, Any]],
+    source_start: float,
+    source_end: float,
+    *,
+    tolerance_sec: float,
+    min_duration_sec: float = 0.5,
+) -> float | None:
+    """Pull a truncated out-point back to the nearest clean cut, never forward."""
+    best: float | None = None
+    for point in cut_points:
+        if point.get("reason") in ("gap_end", "word_start"):
+            continue
+        time_sec = float(point["time_sec"])
+        if source_end - tolerance_sec <= time_sec <= source_end:
+            if time_sec - source_start >= min_duration_sec and (best is None or time_sec > best):
+                best = time_sec
+    return best
 
 
 def _fallback_items(conn) -> list[dict[str, Any]]:
