@@ -402,6 +402,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "timeline_items", "transition_note", "text")
     _ensure_column(conn, "timeline_items", "continuity_score", "real")
     _ensure_column(conn, "timeline_items", "transition_json", "text")
+    _ensure_column(conn, "timeline_items", "caption_decision_json", "text")
     _ensure_column(conn, "segments", "word_units_json", "text")
     _ensure_column(conn, "segments", "story_function", "text")
     _ensure_column(conn, "segments", "setup_questions_json", "text")

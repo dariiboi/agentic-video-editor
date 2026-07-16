@@ -5,7 +5,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .cutpoints import load_cut_points, snap_range
+from .cutpoints import anchor_trim, load_cut_points, snap_range
 from .db import connect_db, migrate
 from .planner import create_edit_plan
 from .project import Project, utc_now
@@ -74,6 +74,7 @@ def create_timeline(
             timeline_cursor += clip_duration
 
         _assign_transitions(items)
+        _assign_captions(items)
         timeline_json = {
             "timeline_id": timeline_id,
             "directive_id": directive_id,
@@ -111,9 +112,9 @@ def create_timeline(
                     segment_id, source_start_sec, source_end_sec, timeline_start_sec,
                     timeline_end_sec, role, reason, why_here, before_context,
                     after_context, caption_text, transition_note, continuity_score,
-                    transition_json, created_at
+                    transition_json, caption_decision_json, created_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
@@ -136,6 +137,7 @@ def create_timeline(
                     item.get("transition_note"),
                     item.get("continuity_score"),
                     json.dumps(item.get("transition")) if item.get("transition") else None,
+                    json.dumps(item.get("caption_decision")) if item.get("caption_decision") else None,
                     now,
                 ),
             )
@@ -250,6 +252,10 @@ def _planned_items(conn, sequence: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "continuity_score": item.get("continuity_score"),
                 "warnings": item.get("warnings") or [],
                 "audio_affordance": item.get("source_evidence", {}).get("audio_affordance"),
+                "word_units": item.get("source_evidence", {}).get("word_units") or [],
+                "needs_caption": item.get("source_evidence", {}).get("needs_caption"),
+                "max_duration_sec": item.get("max_duration_sec"),
+                "trim_anchor": item.get("trim_anchor"),
             }
         )
     return candidates
@@ -271,20 +277,31 @@ def _timeline_item_from_candidate(
         asset_duration = float(asset_duration)
         source_start = min(source_start, max(0.0, asset_duration - 0.1))
         source_end = min(max(source_start + 0.1, source_end), asset_duration)
-    clip_duration = max(0.1, min(max_clip_sec, source_end - source_start, duration_sec - timeline_cursor))
+    effective_max = min(max_clip_sec, float(candidate.get("max_duration_sec") or max_clip_sec))
+    clip_duration = max(0.1, min(effective_max, source_end - source_start, duration_sec - timeline_cursor))
     truncated = clip_duration < (source_end - source_start) - 0.01
-    source_end = source_start + clip_duration
-    if truncated and cut_points and snap_tolerance_sec > 0:
-        snapped_end = _shrink_to_cut_point(
-            cut_points,
+    trim_anchor = candidate.get("trim_anchor")
+    if truncated:
+        source_start, source_end, anchor = anchor_trim(
             source_start,
             source_end,
-            tolerance_sec=snap_tolerance_sec,
+            clip_duration,
+            candidate.get("word_units") or [],
+            hint=str(candidate.get("reason") or ""),
         )
-        if snapped_end is not None:
-            source_end = snapped_end
-            clip_duration = source_end - source_start
-            candidate["cut_snap_end"] = "truncation_snapped"
+        if anchor:
+            trim_anchor = anchor
+        if cut_points and snap_tolerance_sec > 0:
+            snap = snap_range(cut_points, source_start, source_end, tolerance_sec=snap_tolerance_sec)
+            if snap["start_snapped_to"] or snap["end_snapped_to"]:
+                source_start = snap["start_sec"]
+                source_end = snap["end_sec"]
+                candidate["cut_snap_end"] = "truncation_snapped"
+        # snapping may drift past the max shot length; that limit is hard
+        source_end = min(source_end, source_start + effective_max)
+        clip_duration = max(0.1, source_end - source_start)
+    else:
+        source_end = source_start + clip_duration
     item = {
         "id": f"item_{uuid.uuid4().hex[:16]}",
         "asset_id": candidate["asset_id"],
@@ -305,6 +322,8 @@ def _timeline_item_from_candidate(
         "cut_snap_end": candidate.get("cut_snap_end"),
         "warnings": candidate.get("warnings") or [],
         "audio_affordance": candidate.get("audio_affordance"),
+        "trim_anchor": trim_anchor,
+        "needs_caption": candidate.get("needs_caption"),
     }
     item.update(_rational_time_fields(item, float(candidate["fps"] or 30.0)))
     return item, clip_duration
@@ -385,24 +404,28 @@ def _snap_candidate(
         candidate["cut_snap"] = snap
 
 
-def _shrink_to_cut_point(
-    cut_points: list[dict[str, Any]],
-    source_start: float,
-    source_end: float,
-    *,
-    tolerance_sec: float,
-    min_duration_sec: float = 0.5,
-) -> float | None:
-    """Pull a truncated out-point back to the nearest clean cut, never forward."""
-    best: float | None = None
-    for point in cut_points:
-        if point.get("reason") in ("gap_end", "word_start"):
-            continue
-        time_sec = float(point["time_sec"])
-        if source_end - tolerance_sec <= time_sec <= source_end:
-            if time_sec - source_start >= min_duration_sec and (best is None or time_sec > best):
-                best = time_sec
-    return best
+def _assign_captions(items: list[dict[str, Any]]) -> None:
+    """Decide per item whether its caption should burn, with a why.
+
+    Legacy segments have needs_caption unset, so context/archive roles keep
+    their grounding overlays as a fallback.
+    """
+    for item in items:
+        if not item.get("caption_text"):
+            item["caption_decision"] = {"burn": False, "why": "no caption text available"}
+        elif item.get("needs_caption"):
+            item["caption_decision"] = {"burn": True, "why": "segment is marked needs_caption"}
+        elif _norm_role(item.get("role")) in ("context", "archive"):
+            item["caption_decision"] = {"burn": True, "why": "context/archive beat benefits from grounding text"}
+        else:
+            item["caption_decision"] = {
+                "burn": False,
+                "why": "clip reads without words on screen; keep the frame clean",
+            }
+
+
+def _norm_role(value: Any) -> str:
+    return str(value or "").strip().lower()
 
 
 def _fallback_items(conn) -> list[dict[str, Any]]:

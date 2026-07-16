@@ -222,6 +222,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render_parser.add_argument("--burn-captions", action="store_true", help="Burn caption_text into the video")
     render_parser.add_argument("--no-loudnorm", action="store_true", help="Skip the final loudness-normalization pass")
+    render_parser.add_argument(
+        "--loudness-range",
+        type=float,
+        default=11.0,
+        help="loudnorm LRA target; widen (e.g. 15-18) to preserve a quiet-to-loud emotional arc",
+    )
     render_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     render_parser.set_defaults(func=_render_command)
 
@@ -605,6 +611,7 @@ def _render_command(args: argparse.Namespace) -> int:
         crossfade_sec=args.crossfade_sec,
         burn_captions=args.burn_captions,
         normalize_loudness=not args.no_loudnorm,
+        loudness_range=args.loudness_range,
     )
     data = {
         "render_id": summary.render_id,

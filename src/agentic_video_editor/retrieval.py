@@ -46,9 +46,10 @@ def context_search(project: Project, query: str, *, limit: int = 10) -> dict[str
         relationships = _load_relationships(conn)
 
     intent = analyze_directive_intent(query)
+    profile = _weight_profile(intent)
     scored = []
     for segment in segments:
-        score, reasons = _score_segment(segment, query, intent)
+        score, reasons = _score_segment(segment, query, intent, profile)
         if score > 0:
             scored.append((score, segment, reasons))
     if not scored:
@@ -69,6 +70,7 @@ def context_search(project: Project, query: str, *, limit: int = 10) -> dict[str
     return {
         "query": query,
         "intent": intent,
+        "weight_profile": profile["name"],
         "packets": packets,
     }
 
@@ -257,7 +259,33 @@ def _row(row) -> dict[str, Any]:
     return item
 
 
-def _score_segment(segment: dict[str, Any], query: str, intent: dict[str, Any]) -> tuple[float, list[str]]:
+WORD_DRIVEN_TERMS = {"words", "word", "story", "lyric", "lyrics", "spoken", "dialogue", "quote", "quotes", "talking", "says", "line", "lines", "interview"}
+
+VISUAL_DRIVEN_TERMS = {"montage", "visual", "visuals", "cinematic", "energy", "broll", "b_roll"}
+
+WEIGHT_PROFILES = {
+    "default": {"name": "default", "term": 2.0, "role_base": 3.0, "card": 1.5, "quality_cap": 2.0, "transcript_bonus": 0.0},
+    "word_driven": {"name": "word_driven", "term": 2.5, "role_base": 2.0, "card": 1.5, "quality_cap": 1.5, "transcript_bonus": 1.5},
+    "visual_driven": {"name": "visual_driven", "term": 2.0, "role_base": 4.0, "card": 1.5, "quality_cap": 2.5, "transcript_bonus": 0.0},
+}
+
+
+def _weight_profile(intent: dict[str, Any]) -> dict[str, Any]:
+    terms = {_norm(term) for term in intent.get("explicit_terms") or []}
+    if terms & WORD_DRIVEN_TERMS:
+        return WEIGHT_PROFILES["word_driven"]
+    if terms & VISUAL_DRIVEN_TERMS:
+        return WEIGHT_PROFILES["visual_driven"]
+    return WEIGHT_PROFILES["default"]
+
+
+def _score_segment(
+    segment: dict[str, Any],
+    query: str,
+    intent: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+) -> tuple[float, list[str]]:
+    profile = profile or WEIGHT_PROFILES["default"]
     query_terms = _directive_terms(query)
     text = _haystack(segment)
     roles = {_norm(role) for role in segment["story_roles"]}
@@ -266,22 +294,29 @@ def _score_segment(segment: dict[str, Any], query: str, intent: dict[str, Any]) 
 
     hits = [term for term in query_terms if term and term in text]
     if hits:
-        score += len(hits) * 2.0
+        score += len(hits) * profile["term"]
         reasons.append(f"matches directive terms: {', '.join(_dedupe(hits)[:5])}")
+
+    if profile["transcript_bonus"]:
+        transcript_text = _transcript_haystack(segment)
+        transcript_hits = [term for term in query_terms if term and term in transcript_text]
+        if transcript_hits:
+            score += min(3.0, len(transcript_hits) * profile["transcript_bonus"])
+            reasons.append(f"directive terms land in spoken words: {', '.join(_dedupe(transcript_hits)[:4])}")
 
     desired_roles = {_norm(role) for role in intent.get("desired_story_roles", [])}
     role_hits = sorted(roles & desired_roles)
     if role_hits:
-        score += 3.0 + len(role_hits)
+        score += profile["role_base"] + len(role_hits)
         reasons.append(f"story-role fit: {', '.join(role_hits)}")
 
     if segment.get("context_card_id"):
-        score += 1.5
+        score += profile["card"]
         reasons.append("has editorial context card")
 
     quality = segment.get("select_score") or segment.get("quality_score") or 0
     try:
-        score += min(2.0, float(quality) / 5.0)
+        score += min(profile["quality_cap"], float(quality) / 5.0)
     except (TypeError, ValueError):
         pass
 
@@ -290,6 +325,14 @@ def _score_segment(segment: dict[str, Any], query: str, intent: dict[str, Any]) 
         reasons.append("supports requested ending payoff")
 
     return score, reasons
+
+
+def _transcript_haystack(segment: dict[str, Any]) -> str:
+    parts = [
+        segment.get("transcript_summary"),
+        " ".join(str(unit.get("text") or "") for unit in segment.get("word_units") or [] if isinstance(unit, dict)),
+    ]
+    return " ".join(str(part or "").lower() for part in parts)
 
 
 def _fallback_score(segment: dict[str, Any]) -> float:
@@ -327,6 +370,7 @@ def _packet(
         "select_id": segment.get("select_id"),
         "asset_id": segment["asset_id"],
         "file_name": segment["file_name"],
+        "asset_duration_sec": segment.get("asset_duration_sec"),
         "time_range": [segment["start_sec"], segment["end_sec"]],
         "trim_range": [segment.get("trim_start_sec") or segment["start_sec"], segment.get("trim_end_sec") or segment["end_sec"]],
         "score": round(score, 3),
@@ -340,6 +384,7 @@ def _packet(
             "story_function": segment.get("story_function"),
             "audio_affordance": segment.get("audio_affordance"),
             "visual_affordance": segment.get("visual_affordance"),
+            "needs_caption": segment.get("needs_caption"),
             "cut_notes": segment.get("cut_notes"),
         },
         "why_matches": reasons or ["high-scoring candidate from semantic analysis"],

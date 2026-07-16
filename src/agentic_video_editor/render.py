@@ -31,6 +31,7 @@ def render_timeline(
     crossfade_sec: float = 0.0,
     burn_captions: bool = False,
     normalize_loudness: bool = True,
+    loudness_range: float = 11.0,
 ) -> RenderSummary:
     render_id = f"render_{uuid.uuid4().hex[:16]}"
     timeline_row, items = _load_timeline_items(project, timeline_id)
@@ -91,7 +92,7 @@ def render_timeline(
         commands.append(command)
 
         if normalize_loudness:
-            command = _loudnorm_command(combined_path, output_path)
+            command = _loudnorm_command(combined_path, output_path, loudness_range)
             _run(command)
             commands.append(command)
         else:
@@ -200,7 +201,7 @@ def _clip_command(
         "fps=30",
         "format=yuv420p",
     ]
-    caption = item.get("caption_text") if burn_captions else None
+    caption = item.get("caption_text") if burn_captions and _caption_allowed(item) else None
     if caption:
         video_filters.append(_drawtext_filter(str(caption)))
 
@@ -244,6 +245,20 @@ def _clip_command(
         "+faststart",
         str(clip_path),
     ]
+
+
+def _caption_allowed(item: dict[str, Any]) -> bool:
+    """Honor the timeline's per-item caption decision; legacy rows without one
+    keep the old burn-everything behavior."""
+    decision = item.get("caption_decision")
+    if decision is None and item.get("caption_decision_json"):
+        try:
+            decision = json.loads(item["caption_decision_json"])
+        except (TypeError, json.JSONDecodeError):
+            decision = None
+    if not isinstance(decision, dict):
+        return True
+    return bool(decision.get("burn"))
 
 
 def _drawtext_filter(text: str) -> str:
@@ -391,9 +406,10 @@ def _joined_command(
     return command
 
 
-def _loudnorm_command(input_path: Path, output_path: Path) -> list[str]:
+def _loudnorm_command(input_path: Path, output_path: Path, loudness_range: float) -> list[str]:
     # One loudness pass over the whole timeline; per-clip normalization made
-    # music jump in level at every cut.
+    # music jump in level at every cut. A wider LRA preserves a planned
+    # quiet-to-loud emotional arc instead of compressing it flat.
     return [
         "ffmpeg",
         "-y",
@@ -404,7 +420,7 @@ def _loudnorm_command(input_path: Path, output_path: Path) -> list[str]:
         "-c:v",
         "copy",
         "-af",
-        "loudnorm=I=-16:TP=-1.5:LRA=11",
+        f"loudnorm=I=-16:TP=-1.5:LRA={loudness_range:g}",
         "-c:a",
         "aac",
         "-b:a",

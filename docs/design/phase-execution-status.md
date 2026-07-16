@@ -411,6 +411,37 @@ Status: implemented (July 16, 2026).
 - Companion audit of remaining blanket creative decisions:
   [blanket-creative-decisions-audit.md](blanket-creative-decisions-audit.md).
 
+### Phase 6.9: Evidence-Driven Pacing, Trims, Captions, and Retrieval Profiles
+
+Status: implemented (July 16, 2026). Fixes findings 1, 3, 4, 5, 6, 7, 8, 9 of
+[blanket-creative-decisions-audit.md](blanket-creative-decisions-audit.md);
+findings 2 (StoryAgent) and 10 (config consolidation) remain open.
+
+- Per-role pacing: `ROLE_PACING` weights beat targets (payoff 1.4x, hook 0.8x),
+  `_fit_durations` scales proportionally instead of greedily, `_reserve_ending`
+  guarantees the final clip can land, and a word-unit guard never cuts a quoted
+  line in half (extend to the unit's end or exclude it).
+- Evidence-anchored truncation: `cutpoints.anchor_trim` keeps the sub-range around
+  the strongest word unit (or centers the window), recorded as `trim_anchor`.
+  Exposed a legacy-data bug: some Gemini selects claim trim ranges past the end of
+  the asset; the planner now clamps to asset duration.
+- Per-item max shot length from role pacing; CLI `--max-clip-sec` stays a hard
+  ceiling enforced even after cut-point snapping.
+- Per-item caption decisions (`caption_decision_json`, honoring `needs_caption`
+  with a context/archive fallback); renderer obeys under `--burn-captions`.
+- Directive-aware retrieval weight profiles (word_driven / visual_driven /
+  default) with a spoken-word hit bonus for word briefs.
+- Conditional sequencing: payoff swap skipped for trailer/teaser/loop directives;
+  source novelty extends to all beats when assets >= beats; payoff casting
+  prefers selects long enough for an ending.
+- `--loudness-range` exposes loudnorm LRA; semantic prompt scales moment
+  inventory with asset duration (~one per 20-30s, clamped 4-16).
+
+Demo verification (60s directive, 11-asset project): payoff went from 1.26s
+(shortest, squeezed) to the longest clip; with `--max-clip-sec 15` durations
+differentiate by role (hook 7.0s, emotion 10.0s, performance 12.1s, payoff
+15.0s) and the timeline reaches ~58.5s of a 60s target (previously ~31s).
+
 ### Phase 7: Review UI
 
 Status: not started.

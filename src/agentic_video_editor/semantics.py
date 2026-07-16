@@ -108,7 +108,8 @@ def semantic_analyze_project(
 
     totals = {"segments": 0, "selects": 0, "relationships": 0, "completed": 0}
     for asset in assets:
-        payload = provider.generate_video_json(Path(str(asset["video_ref"])), SEMANTIC_PROMPT)
+        prompt = _semantic_prompt(_float(asset.get("duration_sec"), None))
+        payload = provider.generate_video_json(Path(str(asset["video_ref"])), prompt)
         result = _store_semantics(
             project,
             str(asset["id"]),
@@ -127,6 +128,23 @@ def semantic_analyze_project(
         segments_created=totals["segments"],
         selects_created=totals["selects"],
         relationships_created=totals["relationships"],
+    )
+
+
+def _moment_range(duration_sec: float | None) -> tuple[int, int]:
+    """Scale segment inventory with footage length: ~one moment per 20-30s."""
+    if not duration_sec or duration_sec <= 0:
+        return 4, 8
+    low = min(16, max(4, round(duration_sec / 30)))
+    high = min(16, max(low + 1, round(duration_sec / 20)))
+    return low, high
+
+
+def _semantic_prompt(duration_sec: float | None) -> str:
+    low, high = _moment_range(duration_sec)
+    return SEMANTIC_PROMPT.replace(
+        "Pick 4-8 editorially meaningful moments",
+        f"Pick {low}-{high} editorially meaningful moments (about one per 20-30 seconds of footage)",
     )
 
 

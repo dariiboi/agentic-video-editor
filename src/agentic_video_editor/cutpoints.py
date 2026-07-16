@@ -164,6 +164,57 @@ def snap_range(
     }
 
 
+def anchor_trim(
+    start_sec: float,
+    end_sec: float,
+    budget_sec: float,
+    word_units: list[dict[str, Any]] | None = None,
+    *,
+    hint: str = "",
+) -> tuple[float, float, dict[str, Any] | None]:
+    """Choose which sub-range of a select survives truncation.
+
+    The first N seconds of a select are rarely its best; anchor the kept
+    window on the strongest word unit when one exists (preferring a unit the
+    select reason quotes), otherwise center it on the middle of the range.
+    """
+    raw = end_sec - start_sec
+    if budget_sec >= raw - 0.01:
+        return start_sec, end_sec, None
+
+    units: list[dict[str, Any]] = []
+    for unit in word_units or []:
+        if not isinstance(unit, dict):
+            continue
+        try:
+            unit_start = float(unit["start_sec"])
+            unit_end = float(unit["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if unit_end > unit_start and start_sec - 0.01 <= unit_start < end_sec:
+            units.append({"text": str(unit.get("text") or ""), "start_sec": unit_start, "end_sec": unit_end})
+
+    latest_start = end_sec - budget_sec
+    if units:
+        hint_text = (hint or "").lower()
+        chosen = next(
+            (unit for unit in units if unit["text"] and unit["text"].lower() in hint_text),
+            units[0],
+        )
+        window_start = min(chosen["start_sec"] - 0.3, latest_start)
+        why = f'anchored on word unit "{chosen["text"][:48]}"'
+    else:
+        window_start = (start_sec + end_sec) / 2 - budget_sec / 2
+        why = "no word units in range; centered on the middle of the select"
+
+    window_start = max(start_sec, min(window_start, latest_start))
+    return (
+        window_start,
+        window_start + budget_sec,
+        {"why": why, "moved_sec": round(window_start - start_sec, 3)},
+    )
+
+
 def _ready_assets(conn, *, limit: int | None) -> list[dict[str, Any]]:
     query = """
         select id, path, duration_sec, has_audio
