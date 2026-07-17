@@ -372,6 +372,81 @@ def _observation_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in items if isinstance(item, dict)]
 
 
+def observation_text(value: dict[str, Any], *, include_evidence: bool = True) -> str:
+    """Flatten an observation payload to searchable text.
+
+    Retrieval, FTS, and qmd cards all see facet evidence through this one
+    rendering, so a casting attribute like "green t-shirt" is findable the
+    same way everywhere.
+    """
+    skip = {"start_sec", "end_sec", "confidence"}
+    if not include_evidence:
+        skip = skip | {"evidence"}
+    parts: list[str] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for key, item in node.items():
+                if key in skip:
+                    continue
+                _walk(item)
+        elif isinstance(node, list):
+            for item in node:
+                _walk(item)
+        elif isinstance(node, str):
+            if node.strip():
+                parts.append(node.strip())
+
+    _walk(value)
+    return " ".join(parts)
+
+
+def facet_search(project: Project, query: str, *, limit: int = 10) -> list[dict[str, Any]]:
+    from .transcript import _fts_query
+
+    with connect_db(project.db_path) as conn:
+        migrate(conn)
+        rows = conn.execute(
+            """
+            select
+                observations.id,
+                observations.asset_id,
+                assets.file_name,
+                observations.observation_type,
+                observations.start_sec,
+                observations.end_sec,
+                observations.value,
+                observations.confidence,
+                observations.source,
+                bm25(observations_fts) as rank
+            from observations_fts
+            join observations on observations.id = observations_fts.observation_id
+            join assets on assets.id = observations.asset_id
+            where observations_fts match ?
+            order by rank
+            limit ?
+            """,
+            (_fts_query(query), limit),
+        ).fetchall()
+    results = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["value"] = json.loads(item["value"])
+        except (TypeError, json.JSONDecodeError):
+            pass
+        results.append(item)
+    return results
+
+
+def _delete_observations(conn, asset_id: str, source: str) -> None:
+    conn.execute(
+        "delete from observations_fts where observation_id in (select id from observations where asset_id = ? and source = ?)",
+        (asset_id, source),
+    )
+    conn.execute("delete from observations where asset_id = ? and source = ?", (asset_id, source))
+
+
 def _store_facet(
     project: Project,
     asset_id: str,
@@ -382,7 +457,7 @@ def _store_facet(
 ) -> int:
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        conn.execute("delete from observations where asset_id = ? and source = ?", (asset_id, source))
+        _delete_observations(conn, asset_id, source)
         return _insert_observations(conn, asset_id, facet, items, source, duration_sec)
 
 
@@ -398,7 +473,7 @@ def _store_budget(
         facets = {}
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        conn.execute("delete from observations where asset_id = ? and source = ?", (asset_id, source))
+        _delete_observations(conn, asset_id, source)
         created = 0
         for facet in FACETS:
             items = facets.get(facet)
@@ -433,6 +508,7 @@ def _insert_observations(
         value = dict(item)
         value["start_sec"] = round(start, 3)
         value["end_sec"] = round(end, 3)
+        observation_id = f"obs_{uuid.uuid4().hex[:16]}"
         conn.execute(
             """
             insert into observations (
@@ -442,7 +518,7 @@ def _insert_observations(
             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                f"obs_{uuid.uuid4().hex[:16]}",
+                observation_id,
                 "default",
                 asset_id,
                 None,
@@ -454,6 +530,10 @@ def _insert_observations(
                 start,
                 end,
             ),
+        )
+        conn.execute(
+            "insert into observations_fts (observation_id, asset_id, observation_type, text) values (?, ?, ?, ?)",
+            (observation_id, asset_id, facet, f"{facet} {observation_text(value)}"),
         )
         created += 1
     return created

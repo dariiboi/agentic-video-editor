@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .db import connect_db, migrate
+from .facets import observation_text
 from .project import Project, utc_now
 
 
@@ -44,11 +45,12 @@ def export_cards(project: Project, *, out_dir: Path | None = None) -> ExportSumm
         migrate(conn)
         segments = _load_card_segments(conn)
         spans_by_asset = _load_spans_by_asset(conn)
+        observations_by_asset = _load_observations_by_asset(conn)
 
     written = 0
     for segment in segments:
         card_path = cards_dir / f"{segment['id']}.md"
-        card_path.write_text(_card_markdown(segment, spans_by_asset), encoding="utf-8")
+        card_path.write_text(_card_markdown(segment, spans_by_asset, observations_by_asset), encoding="utf-8")
         written += 1
 
     return ExportSummary(cards_written=written, cards_dir=str(cards_dir))
@@ -259,6 +261,27 @@ def _load_card_segments(conn) -> list[dict[str, Any]]:
     return segments
 
 
+def _load_observations_by_asset(conn) -> dict[str, list[dict[str, Any]]]:
+    rows = conn.execute(
+        """
+        select asset_id, observation_type, start_sec, end_sec, value
+        from observations
+        where project_id = ? and start_sec is not null and end_sec is not null
+        order by asset_id, start_sec
+        """,
+        ("default",),
+    ).fetchall()
+    observations: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        try:
+            item["value"] = json.loads(item["value"])
+        except (TypeError, json.JSONDecodeError):
+            item["value"] = {}
+        observations.setdefault(item["asset_id"], []).append(item)
+    return observations
+
+
 def _load_spans_by_asset(conn) -> dict[str, list[dict[str, Any]]]:
     rows = conn.execute(
         """
@@ -275,7 +298,11 @@ def _load_spans_by_asset(conn) -> dict[str, list[dict[str, Any]]]:
     return spans
 
 
-def _card_markdown(segment: dict[str, Any], spans_by_asset: dict[str, list[dict[str, Any]]]) -> str:
+def _card_markdown(
+    segment: dict[str, Any],
+    spans_by_asset: dict[str, list[dict[str, Any]]],
+    observations_by_asset: dict[str, list[dict[str, Any]]] | None = None,
+) -> str:
     lines = [
         f"# {segment['file_name']} {segment['start_sec']:.1f}-{segment['end_sec']:.1f}",
         "",
@@ -311,6 +338,22 @@ def _card_markdown(segment: dict[str, Any], spans_by_asset: dict[str, list[dict[
             f"- [{span['start_sec']:.2f}-{span['end_sec']:.2f}] ({span['kind']}, {span['source']}) {span['text']}"
             for span in overlapping
         ]
+    # facet time ranges are approximate, so overlap matching rather than containment
+    facet_rows = [
+        obs
+        for obs in (observations_by_asset or {}).get(segment["asset_id"], [])
+        if obs["start_sec"] < segment["end_sec"] and segment["start_sec"] < obs["end_sec"]
+    ]
+    if facet_rows:
+        lines += ["", "## Facets", ""]
+        for obs in facet_rows:
+            value = obs["value"] if isinstance(obs["value"], dict) else {}
+            text = observation_text(value, include_evidence=False)
+            evidence = str(value.get("evidence") or "").strip()
+            entry = f"- [{obs['start_sec']:.2f}-{obs['end_sec']:.2f}] {obs['observation_type']}: {text}"
+            if evidence:
+                entry += f" — {evidence}"
+            lines.append(entry)
     if segment.get("setup_questions"):
         lines += ["", "## Raises", ""] + [f"- {q}" for q in segment["setup_questions"]]
     if segment.get("payoff_answers"):

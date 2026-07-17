@@ -216,6 +216,9 @@ def migrate(conn: sqlite3.Connection) -> None:
             created_at text not null
         );
 
+        create virtual table if not exists observations_fts
+            using fts5(observation_id unindexed, asset_id unindexed, observation_type unindexed, text);
+
         create table if not exists selects (
             id text primary key,
             project_id text not null references projects(id) on delete cascade,

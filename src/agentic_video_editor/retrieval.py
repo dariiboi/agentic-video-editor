@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any
 
 from .db import connect_db, migrate
+from .facets import observation_text
 from .project import Project
 
 
@@ -216,7 +217,50 @@ def _load_search_segments(conn) -> list[dict[str, Any]]:
         """,
         ("default",),
     ).fetchall()
-    return [_row(row) for row in rows]
+    segments = [_row(row) for row in rows]
+    _attach_facets(conn, segments)
+    return segments
+
+
+def _attach_facets(conn, segments: list[dict[str, Any]]) -> None:
+    """Attach facet observations overlapping each segment's time range.
+
+    Facet time ranges are approximate, so overlap matching rather than
+    containment. The observation text joins the searchable haystack and is
+    citable in packet evidence.
+    """
+    rows = conn.execute(
+        """
+        select asset_id, observation_type, start_sec, end_sec, value
+        from observations
+        where project_id = ? and start_sec is not null and end_sec is not null
+        order by asset_id, start_sec
+        """,
+        ("default",),
+    ).fetchall()
+    by_asset: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        item = dict(row)
+        try:
+            value = json.loads(item["value"])
+        except (TypeError, json.JSONDecodeError):
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        item["text"] = observation_text(value, include_evidence=False)
+        item["evidence"] = str(value.get("evidence") or "")
+        by_asset[item["asset_id"]].append(item)
+    for segment in segments:
+        segment["facets"] = [
+            {
+                "observation_type": obs["observation_type"],
+                "time_range": [obs["start_sec"], obs["end_sec"]],
+                "text": obs["text"],
+                "evidence": obs["evidence"],
+            }
+            for obs in by_asset.get(segment["asset_id"], [])
+            if obs["start_sec"] < segment["end_sec"] and segment["start_sec"] < obs["end_sec"]
+        ]
 
 
 def _load_relationships(conn) -> dict[str, list[dict[str, Any]]]:
@@ -310,6 +354,13 @@ def _score_segment(
         score += profile["role_base"] + len(role_hits)
         reasons.append(f"story-role fit: {', '.join(role_hits)}")
 
+    facet_text = _facet_haystack(segment)
+    facet_hits = [term for term in query_terms if term and term in facet_text]
+    if facet_hits:
+        # already scored through the haystack; the reason makes the facet
+        # evidence citable in why_matches
+        reasons.append(f"facet observations match: {', '.join(_dedupe(facet_hits)[:4])}")
+
     if segment.get("context_card_id"):
         score += profile["card"]
         reasons.append("has editorial context card")
@@ -325,6 +376,14 @@ def _score_segment(
         reasons.append("supports requested ending payoff")
 
     return score, reasons
+
+
+def _facet_haystack(segment: dict[str, Any]) -> str:
+    parts = []
+    for obs in segment.get("facets") or []:
+        parts.append(str(obs.get("text") or ""))
+        parts.append(str(obs.get("evidence") or ""))
+    return " ".join(part.lower() for part in parts if part)
 
 
 def _transcript_haystack(segment: dict[str, Any]) -> str:
@@ -386,6 +445,7 @@ def _packet(
             "visual_affordance": segment.get("visual_affordance"),
             "needs_caption": segment.get("needs_caption"),
             "cut_notes": segment.get("cut_notes"),
+            "facets": (segment.get("facets") or [])[:12],
         },
         "why_matches": reasons or ["high-scoring candidate from semantic analysis"],
         "why_belongs_before_after": _placement_hint(segment),
@@ -464,6 +524,7 @@ def _haystack(segment: dict[str, Any]) -> str:
         " ".join(segment.get("actions") or []),
         " ".join(segment.get("moods") or []),
         " ".join(segment.get("people") or []),
+        _facet_haystack(segment),
     ]
     return " ".join(str(part or "").lower().replace(" ", "_") for part in parts)
 

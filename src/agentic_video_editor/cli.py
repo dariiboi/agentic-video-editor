@@ -10,7 +10,7 @@ from .analyze import analyze_project, summarize_local_analysis
 from .context import build_editorial_context, context_summary
 from .critique import critique_render, review_summary
 from .cutpoints import cut_point_summary, detect_cut_points
-from .facets import FACETS, facet_analyze_project, facet_summary
+from .facets import FACETS, facet_analyze_project, facet_search, facet_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .planner import create_edit_plan
@@ -157,6 +157,13 @@ def build_parser() -> argparse.ArgumentParser:
     facets_summary_parser.add_argument("project_dir", type=Path)
     facets_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     facets_summary_parser.set_defaults(func=_facets_summary_command)
+
+    facet_search_parser = subcommands.add_parser("facet-search", help="Full-text search facet observations")
+    facet_search_parser.add_argument("project_dir", type=Path)
+    facet_search_parser.add_argument("query")
+    facet_search_parser.add_argument("--limit", type=int, default=10)
+    facet_search_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    facet_search_parser.set_defaults(func=_facet_search_command)
 
     context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
     context_build_parser.add_argument("project_dir", type=Path)
@@ -534,6 +541,21 @@ def _facets_summary_command(args: argparse.Namespace) -> int:
         print(f"Observations: {data['observations']}")
         for facet, count in data["by_facet"].items():
             print(f"  {facet}: {count}")
+    return 0
+
+
+def _facet_search_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    results = facet_search(project, args.query, limit=args.limit)
+    if args.json:
+        print(json.dumps({"results": results}, indent=2))
+    else:
+        for result in results:
+            evidence = result["value"].get("evidence") if isinstance(result["value"], dict) else None
+            print(
+                f"{result['file_name']} {result['start_sec']:.1f}-{result['end_sec']:.1f} "
+                f"[{result['observation_type']}]: {evidence or result['value']}"
+            )
     return 0
 
 
