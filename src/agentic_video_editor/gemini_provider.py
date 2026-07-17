@@ -4,9 +4,10 @@ import json
 import os
 import re
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 DEFAULT_MODEL = "gemini-2.5-flash"
@@ -18,22 +19,14 @@ class GeminiProvider:
     env_path: Path = Path(".gemini_api.env")
 
     def generate_text_json(self, prompt: str) -> dict[str, Any]:
-        from google import genai
-        from google.genai import types
-
-        api_key = load_gemini_api_key(self.env_path)
-        client = genai.Client(api_key=api_key)
+        client = _build_client(self.env_path)
         last_error: Exception | None = None
         for attempt in range(3):
             try:
                 response = client.models.generate_content(
                     model=self.model,
                     contents=[prompt],
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        responseMimeType="application/json",
-                        maxOutputTokens=8192,
-                    ),
+                    config=_generation_config(),
                 )
                 return parse_json_response(response.text or "{}")
             except Exception as exc:
@@ -42,42 +35,75 @@ class GeminiProvider:
                     raise
                 time.sleep(5 * (attempt + 1))
         raise RuntimeError("Gemini request failed") from last_error
+
+    @contextmanager
+    def video_session(self, video_path: Path) -> Iterator[GeminiVideoSession]:
+        """Upload the video once and run any number of prompts against it.
+
+        The Files API keeps uploads for 48h; deleting only on session exit is
+        what makes a multi-prompt analysis cost tokens instead of uploads.
+        """
+        session = GeminiVideoSession(_build_client(self.env_path), self.model, video_path)
+        try:
+            yield session
+        finally:
+            session.close()
 
     def generate_video_json(self, video_path: Path, prompt: str) -> dict[str, Any]:
-        from google import genai
-        from google.genai import types
+        with self.video_session(video_path) as session:
+            return session.generate_json(prompt)
 
-        api_key = load_gemini_api_key(self.env_path)
-        client = genai.Client(api_key=api_key)
+
+class GeminiVideoSession:
+    """One uploaded video file serving many generate calls."""
+
+    def __init__(self, client, model: str, video_path: Path) -> None:
+        self._client = client
+        self._model = model
+        self._video_path = video_path
+        self._uploaded = None
+
+    def generate_json(self, prompt: str) -> dict[str, Any]:
         last_error: Exception | None = None
         for attempt in range(3):
-            uploaded = client.files.upload(file=video_path)
             try:
-                uploaded = _wait_for_file(client, uploaded)
-                response = client.models.generate_content(
-                    model=self.model,
+                uploaded = self._ensure_uploaded()
+                response = self._client.models.generate_content(
+                    model=self._model,
                     contents=[uploaded, prompt],
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        responseMimeType="application/json",
-                        maxOutputTokens=8192,
-                    ),
+                    config=_generation_config(),
                 )
                 return parse_json_response(response.text or "{}")
             except Exception as exc:
                 last_error = exc
-                if not _is_retryable(exc) or attempt == 2:
+                if not (_is_retryable(exc) or _is_file_failure(exc)) or attempt == 2:
                     raise
+                if _is_file_failure(exc):
+                    # only a dead handle justifies paying for a re-upload
+                    self.close()
                 time.sleep(5 * (attempt + 1))
-            finally:
-                _delete_file_quietly(client, uploaded)
         raise RuntimeError("Gemini request failed") from last_error
+
+    def _ensure_uploaded(self):
+        if self._uploaded is None:
+            uploaded = self._client.files.upload(file=self._video_path)
+            self._uploaded = _wait_for_file(self._client, uploaded)
+        return self._uploaded
+
+    def close(self) -> None:
+        if self._uploaded is not None:
+            _delete_file_quietly(self._client, self._uploaded)
+            self._uploaded = None
 
 
 class MockProvider:
     def generate_text_json(self, prompt: str) -> dict[str, Any]:
         del prompt
         return {}
+
+    @contextmanager
+    def video_session(self, video_path: Path) -> Iterator[MockVideoSession]:
+        yield MockVideoSession(self, video_path)
 
     def generate_video_json(self, video_path: Path, prompt: str) -> dict[str, Any]:
         del prompt
@@ -128,6 +154,17 @@ class MockProvider:
         }
 
 
+class MockVideoSession:
+    """Session-shaped wrapper so callers can treat mock and Gemini alike."""
+
+    def __init__(self, provider: MockProvider, video_path: Path) -> None:
+        self._provider = provider
+        self._video_path = video_path
+
+    def generate_json(self, prompt: str) -> dict[str, Any]:
+        return self._provider.generate_video_json(self._video_path, prompt)
+
+
 def load_gemini_api_key(env_path: Path = Path(".gemini_api.env")) -> str:
     path = env_path.expanduser().resolve()
     if not path.exists():
@@ -168,6 +205,22 @@ def parse_json_response(text: str) -> dict[str, Any]:
     return value
 
 
+def _build_client(env_path: Path):
+    from google import genai
+
+    return genai.Client(api_key=load_gemini_api_key(env_path))
+
+
+def _generation_config():
+    from google.genai import types
+
+    return types.GenerateContentConfig(
+        temperature=0.2,
+        responseMimeType="application/json",
+        maxOutputTokens=8192,
+    )
+
+
 def _wait_for_file(client, uploaded):
     for _ in range(120):
         state = getattr(uploaded, "state", None)
@@ -202,5 +255,18 @@ def _is_retryable(exc: Exception) -> bool:
             "deadline",
             "temporarily",
             "did not return valid json",
+        ]
+    )
+
+
+def _is_file_failure(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        fragment in text
+        for fragment in [
+            "file processing failed",
+            "not in an active state",
+            "file has expired",
+            "file not found",
         ]
     )
