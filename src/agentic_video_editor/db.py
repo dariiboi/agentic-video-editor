@@ -382,6 +382,18 @@ def migrate(conn: sqlite3.Connection) -> None:
         create index if not exists idx_word_alignments_asset_time
             on word_alignments(asset_id, start_sec, end_sec);
 
+        create table if not exists structures (
+            id text primary key,
+            project_id text not null references projects(id) on delete cascade,
+            directive_id text references directives(id) on delete set null,
+            intent_analysis_id text references intent_analyses(id) on delete set null,
+            structure_json text not null,
+            raw_json text not null,
+            source text not null,
+            fallback integer not null default 0,
+            created_at text not null
+        );
+
         create table if not exists edit_plans (
             id text primary key,
             project_id text not null references projects(id) on delete cascade,

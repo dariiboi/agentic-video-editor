@@ -15,12 +15,13 @@ from .facets import FACETS, facet_analyze_project, facet_search, facet_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .intent import analyze_intent, intent_markdown
-from .planner import create_edit_plan
+from .planner import create_edit_plan, create_structured_plan
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
 from .render import render_summary, render_timeline
 from .retrieval import context_search, related_segments
 from .semantics import search_segments, semantic_analyze_project, semantic_summary
+from .structure import author_structure, structure_markdown
 from .timeline import create_timeline, get_timeline, timeline_summary
 from .transcript import search_transcripts, transcribe_project, transcript_summary
 
@@ -182,6 +183,16 @@ def build_parser() -> argparse.ArgumentParser:
     intent_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     intent_parser.set_defaults(func=_intent_command)
 
+    structure_parser = subcommands.add_parser("structure", help="Author an ad-hoc narrative structure for a directive")
+    structure_parser.add_argument("project_dir", type=Path)
+    structure_parser.add_argument("--directive", required=True)
+    structure_parser.add_argument("--duration-sec", type=float, default=60.0)
+    structure_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"])
+    structure_parser.add_argument("--model", default=DEFAULT_MODEL)
+    structure_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
+    structure_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    structure_parser.set_defaults(func=_structure_command)
+
     context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
     context_build_parser.add_argument("project_dir", type=Path)
     context_build_parser.add_argument("--provider", default="mock", choices=["gemini", "mock"])
@@ -227,6 +238,15 @@ def build_parser() -> argparse.ArgumentParser:
     edit_plan_parser.add_argument("project_dir", type=Path)
     edit_plan_parser.add_argument("--directive", required=True)
     edit_plan_parser.add_argument("--duration-sec", type=float, default=60.0)
+    edit_plan_parser.add_argument(
+        "--engine",
+        default="legacy",
+        choices=["legacy", "structured"],
+        help="structured runs IntentAgent -> StructureAgent -> cast; legacy keeps the fixed-beat planner",
+    )
+    edit_plan_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"], help="Structured engine only")
+    edit_plan_parser.add_argument("--model", default=DEFAULT_MODEL)
+    edit_plan_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     edit_plan_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     edit_plan_parser.set_defaults(func=_edit_plan_command)
 
@@ -679,9 +699,44 @@ def _related_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _structure_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    intent = analyze_intent(
+        project,
+        args.directive,
+        duration_sec=args.duration_sec,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+    )
+    structure = author_structure(
+        project,
+        intent,
+        duration_sec=args.duration_sec,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+    )
+    if args.json:
+        print(json.dumps(structure, indent=2))
+    else:
+        print(structure_markdown(structure))
+    return 0
+
+
 def _edit_plan_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
-    data = create_edit_plan(project, directive=args.directive, duration_sec=args.duration_sec)
+    if args.engine == "structured":
+        data = create_structured_plan(
+            project,
+            directive=args.directive,
+            duration_sec=args.duration_sec,
+            provider_name=args.provider,
+            model=args.model,
+            env_path=args.env_path,
+        )
+    else:
+        data = create_edit_plan(project, directive=args.directive, duration_sec=args.duration_sec)
     if args.json:
         print(json.dumps(data, indent=2))
     else:

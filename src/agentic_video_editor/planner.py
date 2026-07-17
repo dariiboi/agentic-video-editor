@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import uuid
+from pathlib import Path
 from typing import Any
 
 from .cutpoints import anchor_trim
 from .db import connect_db, migrate
+from .gemini_provider import DEFAULT_MODEL
+from .intent import analyze_intent
 from .project import Project, utc_now
 from .retrieval import analyze_directive_intent, context_search
+from .structure import author_structure, expand_structure, intensity_to_weight, validate_ordering
 
 
 DEFAULT_BEATS = [
@@ -311,13 +315,14 @@ def _ensure_payoff_last(
     return selected_sequence
 
 
-def _assign_timing(selected_sequence: list[dict[str, Any]], duration_sec: float) -> None:
+def _assign_timing(selected_sequence: list[dict[str, Any]], duration_sec: float, *, reserve_ending: bool = True) -> None:
     if not selected_sequence:
         return
     targets = [max(0.5, float(item.get("target_duration_sec") or item["duration_sec"])) for item in selected_sequence]
     caps = [max(0.5, float(item.get("max_available_sec") or item["duration_sec"])) for item in selected_sequence]
     durations = _fit_durations(targets, caps, duration_sec)
-    _reserve_ending(durations, caps)
+    if reserve_ending:
+        _reserve_ending(durations, caps)
 
     cursor = 0.0
     for item, duration in zip(selected_sequence, durations):
@@ -505,6 +510,280 @@ def _dedupe(values: list[str]) -> list[str]:
             seen.add(key)
             result.append(value)
     return result
+
+
+# --- Structured engine (IntentAgent -> StructureAgent -> cast -> compile) ----
+
+
+def create_structured_plan(
+    project: Project,
+    *,
+    directive: str,
+    duration_sec: float = 60.0,
+    provider_name: str = "gemini",
+    model: str = DEFAULT_MODEL,
+    env_path: Path = Path(".gemini_api.env"),
+    source: str = "structured",
+    store: bool = True,
+) -> dict[str, Any]:
+    """Directive -> intent -> ad-hoc structure -> cast -> timing.
+
+    Casting here is a BRIDGE: per-slot context_search plus a deterministic
+    selector, marked for replacement by the B7 QueryAgent/CastingAgent. The
+    structure authoring, expansion, intensity timing, and ordering validation
+    are the durable parts.
+    """
+    intent = analyze_intent(
+        project,
+        directive,
+        duration_sec=duration_sec,
+        provider_name=provider_name,
+        model=model,
+        env_path=env_path,
+        store=store,
+    )
+    structure = author_structure(
+        project,
+        intent,
+        duration_sec=duration_sec,
+        provider_name=provider_name,
+        model=model,
+        env_path=env_path,
+        store=store,
+    )
+    casting_warnings: list[str] = []
+    slots = expand_structure(structure, duration_sec=duration_sec)
+    slots = _expand_generator_slots(project, slots, casting_warnings)
+    _assign_slot_targets(slots, duration_sec)
+    lane_filters = {lane["id"]: lane["casting_filter"] for lane in structure.get("lanes", [])}
+    items = _cast_slots_bridge(project, directive, slots, lane_filters, structure, duration_sec, casting_warnings)
+    _assign_timing(items, duration_sec, reserve_ending=bool(structure["ending_policy"].get("reserve_ending", True)))
+    plan = {
+        "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
+        "engine": "structured",
+        "directive": directive,
+        "duration_target_sec": duration_sec,
+        "intent_analysis": intent,
+        "structure_id": structure.get("structure_id"),
+        "structure": {key: value for key, value in structure.items() if key != "raw_response"},
+        "expanded_slots": slots,
+        "selected_sequence": items,
+        "casting_warnings": casting_warnings,
+        "ordering_violations": validate_ordering(structure, items),
+        "continuity_warnings": _continuity_warnings(items),
+        "sequencing_note": "BRIDGE casting: context_search + deterministic selector; B7 replaces with QueryAgent/CastingAgent",
+    }
+    if store:
+        _store_structured_plan(project, intent, plan, source)
+    return plan
+
+
+def _expand_generator_slots(
+    project: Project,
+    slots: list[dict[str, Any]],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Unroll enumerate generator slots into one concrete slot per match."""
+    expanded: list[dict[str, Any]] = []
+    for slot in slots:
+        generator = slot.get("generator")
+        if not generator:
+            expanded.append(slot)
+            continue
+        packets = context_search(project, generator["from_query"], limit=int(generator["cap"]))["packets"]
+        packets = packets[: int(generator["cap"])]
+        if generator.get("order") == "chronological":
+            packets.sort(key=lambda packet: (packet["file_name"], float(packet["trim_range"][0])))
+        if not packets:
+            warnings.append(f"slot {slot['slot_id']} uncast: no matches for {generator['from_query']!r}")
+            continue
+        for index, packet in enumerate(packets):
+            concrete = dict(slot)
+            concrete["slot_id"] = f"{slot['beat_id']}#{index + 1}"
+            concrete["generator"] = None
+            concrete["generated_from"] = generator["from_query"]
+            concrete["preselected_packet"] = packet
+            expanded.append(concrete)
+    for position, slot in enumerate(expanded):
+        slot["position"] = position
+    return expanded
+
+
+def _assign_slot_targets(slots: list[dict[str, Any]], duration_sec: float) -> None:
+    """Intensity -> duration weight; ROLE_PACING only when intensity is absent."""
+    for slot in slots:
+        if slot.get("intensity") is not None:
+            slot["pacing_weight"] = intensity_to_weight(slot["intensity"])
+            slot["pacing_why"] = f"intensity target {slot['intensity']} from the structure"
+            slot["max_multiplier"] = DEFAULT_PACING["max_multiplier"]
+        else:
+            fallback = ROLE_PACING.get(_norm(slot["function"]), DEFAULT_PACING)
+            slot["pacing_weight"] = fallback["weight"]
+            slot["pacing_why"] = f"structure omitted intensity; role-pacing fallback ({fallback['why']})"
+            slot["max_multiplier"] = fallback["max_multiplier"]
+    total = sum(slot["pacing_weight"] for slot in slots) or 1.0
+    for slot in slots:
+        target = max(1.5, duration_sec * slot["pacing_weight"] / total)
+        slot["target_duration_sec"] = round(target, 3)
+        slot["max_duration_sec"] = round(target * slot["max_multiplier"], 3)
+
+
+def _cast_slots_bridge(
+    project: Project,
+    directive: str,
+    slots: list[dict[str, Any]],
+    lane_filters: dict[str, str],
+    structure: dict[str, Any],
+    duration_sec: float,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """BRIDGE selector (B7 replaces): retrieval-ranked, lane-aware, motif-aware."""
+    items: list[dict[str, Any]] = []
+    used_segments: set[str] = set()
+    motif_registry: dict[str, dict[str, Any]] = {}
+    hints = structure.get("transition_policy_hints") or {}
+
+    for slot in slots:
+        packets = _slot_candidates(project, directive, slot, lane_filters, warnings)
+        if not packets:
+            warnings.append(f"slot {slot['slot_id']} uncast: no candidates")
+            slot.pop("preselected_packet", None)
+            continue
+        motif = slot.get("motif")
+        if motif and motif["occurrence"] > 1 and motif["slot"] in motif_registry:
+            packets = [motif_registry[motif["slot"]]]
+            warnings.append(
+                f"slot {slot['slot_id']} reuses motif {motif['slot']!r} material (sanctioned recurrence"
+                + (f": {motif['transform']}" if motif.get("transform") else "")
+                + ")"
+            )
+        shots = slot["fill"]["shots_min"] if slot.get("fill") else 1
+        shots = max(1, min(shots, len(packets)))
+        per_shot_target = slot["target_duration_sec"] / shots
+        for shot_index in range(shots):
+            packet = _pick_packet(packets, used_segments, shot_index, slot, warnings)
+            beat = {
+                "id": slot["slot_id"],
+                "role": slot["function"],
+                "target_duration_sec": round(per_shot_target, 3),
+                "max_duration_sec": slot["max_duration_sec"],
+                "pacing": {"weight": slot["pacing_weight"], "why": slot["pacing_why"]},
+            }
+            item = _sequence_item(beat, packet, len(items), duration_sec)
+            item["slot_id"] = slot["slot_id"]
+            item["beat_id"] = slot["beat_id"]
+            item["lane"] = slot.get("lane")
+            item["intensity"] = slot.get("intensity")
+            item["motif"] = motif
+            item["withhold"] = slot.get("withhold") or []
+            item["recontextualizes"] = slot.get("recontextualizes")
+            item["why_here"] = _structured_why(slot, packet)
+            hint = hints.get(slot["function"])
+            if hint:
+                item["transition_note"] = f"{hint} (structure hint for {slot['function']})"
+            items.append(item)
+            used_segments.add(packet["segment_id"])
+            if motif and motif["occurrence"] == 1 and motif["slot"] not in motif_registry:
+                motif_registry[motif["slot"]] = packet
+        slot.pop("preselected_packet", None)
+    return items
+
+
+def _slot_candidates(
+    project: Project,
+    directive: str,
+    slot: dict[str, Any],
+    lane_filters: dict[str, str],
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    if slot.get("preselected_packet"):
+        return [slot["preselected_packet"]]
+    lane_filter = lane_filters.get(slot["lane"] or "", "")
+    query = " ".join(
+        part
+        for part in (directive, lane_filter, slot["casting_filter"], slot["visual_need"], slot["word_need"])
+        if part
+    )
+    packets = context_search(project, query, limit=8)["packets"]
+    if slot["lane"] and lane_filter:
+        matched = [packet for packet in packets if _lane_matches(packet, lane_filter)]
+        if matched:
+            packets = matched
+        elif packets:
+            warnings.append(
+                f"slot {slot['slot_id']}: no candidate carries lane evidence for {lane_filter!r}; "
+                "casting unfiltered (BRIDGE approximation)"
+            )
+    return packets
+
+
+def _lane_matches(packet: dict[str, Any], lane_filter: str) -> bool:
+    """Approximate lane check: the filter's value terms must appear in the
+    packet's facet evidence (of the named facet type when one is given)."""
+    facet_name, _, value = lane_filter.partition(":")
+    if not value:
+        facet_name, value = "", lane_filter
+    facet_name = facet_name.strip().lower()
+    terms = [term for term in _norm(value).split("_") if len(term) > 1]
+    if not terms:
+        return True
+    haystack = " ".join(
+        f"{facet.get('text') or ''} {facet.get('evidence') or ''}".lower()
+        for facet in packet.get("source_evidence", {}).get("facets") or []
+        if not facet_name or str(facet.get("observation_type") or "").lower() == facet_name
+    )
+    return all(term in haystack for term in terms)
+
+
+def _pick_packet(
+    packets: list[dict[str, Any]],
+    used_segments: set[str],
+    shot_index: int,
+    slot: dict[str, Any],
+    warnings: list[str],
+) -> dict[str, Any]:
+    fresh = [packet for packet in packets if packet["segment_id"] not in used_segments]
+    if fresh:
+        return fresh[0]
+    packet = packets[shot_index % len(packets)]
+    warnings.append(f"slot {slot['slot_id']} reuses segment {packet['segment_id']} (corpus smaller than the structure)")
+    return packet
+
+
+def _structured_why(slot: dict[str, Any], packet: dict[str, Any]) -> str:
+    reasons = "; ".join(packet.get("why_matches", [])[:2])
+    intensity = f", intensity {slot['intensity']}" if slot.get("intensity") is not None else ""
+    facets = packet.get("source_evidence", {}).get("facets") or []
+    facet_bit = ""
+    if facets:
+        evidence = facets[0].get("evidence") or facets[0].get("text")
+        if evidence:
+            facet_bit = f" Facet evidence: {evidence}"
+    core = reasons or str(packet.get("source_evidence", {}).get("summary") or "cast for the directive")
+    return f"{slot['function']} beat{intensity}: {core}.{facet_bit}"
+
+
+def _store_structured_plan(project: Project, intent: dict[str, Any], plan: dict[str, Any], source: str) -> None:
+    with connect_db(project.db_path) as conn:
+        migrate(conn)
+        conn.execute(
+            """
+            insert into edit_plans (
+                id, project_id, directive_id, intent_analysis_id, plan_json, source, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                plan["plan_id"],
+                "default",
+                intent.get("directive_id"),
+                intent.get("intent_id"),
+                json.dumps(plan, indent=2),
+                source,
+                utc_now(),
+            ),
+        )
+        conn.commit()
 
 
 def _norm(value: Any) -> str:

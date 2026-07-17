@@ -101,6 +101,9 @@ class MockProvider:
         intent_payload = _mock_intent_payload(prompt)
         if intent_payload is not None:
             return intent_payload
+        structure_payload = _mock_structure_payload(prompt)
+        if structure_payload is not None:
+            return structure_payload
         return {}
 
     @contextmanager
@@ -408,6 +411,143 @@ def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
         return base
 
     return base
+
+
+def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
+    """Deterministic canned StructureAgent replies keyed off the embedded brief.
+
+    Dispatches on the EDIT_TYPE/MODE marker lines the structure prompt carries
+    so acceptance tests can steer lanes, patterns, ramps, and motifs offline.
+    """
+    if "STRUCTURE_AGENT" not in prompt:
+        return None
+    edit_type_match = re.search(r"^EDIT_TYPE: (.*)$", prompt, flags=re.M)
+    mode_match = re.search(r"^MODE: (.*)$", prompt, flags=re.M)
+    duration_match = re.search(r"^TARGET DURATION_SEC: (.*)$", prompt, flags=re.M)
+    edit_type = (edit_type_match.group(1) if edit_type_match else "").strip()
+    mode = (mode_match.group(1) if mode_match else "compose").strip()
+    try:
+        duration_sec = float((duration_match.group(1) if duration_match else "60").strip())
+    except ValueError:
+        duration_sec = 60.0
+
+    duration_ack = {
+        "duration_sec": {
+            "value": duration_sec,
+            "provenance": "user_explicit",
+            "why": "target duration supplied with the request",
+        }
+    }
+
+    if edit_type == "faction_battle":
+        return {
+            "logline": "Two crews trade escalating moves until one owns the floor.",
+            "constraints_ack": duration_ack,
+            "lanes": [
+                {"id": "green", "casting_filter": "people_appearance: green t-shirt"},
+                {"id": "blue", "casting_filter": "people_appearance: blue t-shirt"},
+            ],
+            "beats": [
+                {
+                    "id": "b1",
+                    "function": "meet_faction",
+                    "lane": "green",
+                    "intensity_target": 0.3,
+                    "motif": {"slot": "m1", "occurrence": 1},
+                    "visual_need": "group identity shot, green shirts together",
+                },
+                {
+                    "id": "b2",
+                    "function": "meet_faction",
+                    "lane": "blue",
+                    "intensity_target": 0.3,
+                    "visual_need": "group identity shot, blue shirts together",
+                },
+                {
+                    "id": "b3-b6",
+                    "pattern": "alternate",
+                    "lanes": ["green", "blue"],
+                    "function": "escalation",
+                    "intensity_target": [0.4, 0.9],
+                    "visual_need": "increasingly aggressive/energetic actions",
+                },
+                {
+                    "id": "b7",
+                    "function": "collision",
+                    "lane": None,
+                    "intensity_target": 1.0,
+                    "fill": {"shots": [2, 4], "continuity": ["setting_context"]},
+                    "visual_need": "both colors in frame OR fastest cut pair",
+                },
+                {
+                    "id": "b8",
+                    "function": "aftermath",
+                    "intensity_target": 0.2,
+                    "motif": {"slot": "m1", "occurrence": 2, "transform": "shorter, now reads as before-the-storm"},
+                },
+            ],
+            "ordering_constraints": [{"type": "before", "a": "b1", "b": "b7"}],
+            "juxtaposition_rules": ["adjacent lane shots should match action direction or contrast energy"],
+            "transition_policy_hints": {"escalation": "hard cuts only", "aftermath": "allow dissolve"},
+            "ending_policy": {"intent": "aftermath, not a winner card", "reserve_ending": True},
+        }
+
+    if mode == "enumerate":
+        spoken = re.search(r"spoken word '([^']+)'", prompt)
+        from_query = f"spoken word '{spoken.group(1)}'" if spoken else "every matching moment"
+        return {
+            "logline": "Every match, in order.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {
+                    "id": "e1",
+                    "pattern": "enumerate",
+                    "function": "occurrence",
+                    "from_query": from_query,
+                    "order": "chronological",
+                    "cap": 12,
+                    "intensity_target": 0.6,
+                }
+            ],
+            "ordering_constraints": [],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "end on the last occurrence", "reserve_ending": False},
+        }
+
+    if edit_type == "footage_first_pitch":
+        return {
+            "logline": "Pitched from the corpus profile: the strongest indexed moments, threaded as one build.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "p1", "function": "establish", "intensity_target": 0.4, "visual_need": "strong opener from the profile"},
+                {"id": "p2", "function": "texture", "intensity_target": 0.5},
+                {"id": "p3", "function": "lift", "intensity_target": 0.7},
+                {"id": "p4", "function": "settle", "intensity_target": 0.3},
+            ],
+            "ordering_constraints": [],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "settle rather than peak", "reserve_ending": True},
+        }
+
+    return {
+        "logline": "A single build shaped for the directive.",
+        "constraints_ack": duration_ack,
+        "lanes": [],
+        "beats": [
+            {"id": "d1", "function": "opening", "intensity_target": 0.4},
+            {"id": "d2", "function": "build", "intensity_target": 0.6},
+            {"id": "d3", "function": "peak", "intensity_target": 0.85},
+            {"id": "d4", "function": "landing", "intensity_target": 0.3},
+        ],
+        "ordering_constraints": [{"type": "before", "a": "d1", "b": "d4"}],
+        "juxtaposition_rules": [],
+        "transition_policy_hints": {},
+        "ending_policy": {"intent": "land the ending", "reserve_ending": True},
+    }
 
 
 class MockVideoSession:
