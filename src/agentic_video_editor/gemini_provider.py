@@ -360,6 +360,7 @@ def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
                 "why": "a subtractive ask implies the remainder is the deliverable",
             }
         )
+        base["evidence_attributes"] = _mock_removal_targets(lowered)
         return base
 
     if lowered.startswith("revise") or "make the middle" in lowered:
@@ -463,6 +464,35 @@ def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
         return base
 
     return base
+
+
+def _mock_removal_targets(lowered_directive: str) -> list[str]:
+    """Parse the object phrases of a subtractive directive into removal targets.
+
+    Mechanical asks (silences, dead moments) are routed by subtract.py from the
+    directive text itself, so they are excluded here; only semantic targets
+    ("the throwing", "the arguments") become evidence attributes.
+    """
+    mechanical = (
+        "silence", "silences", "silent", "quiet", "dead air", "pause", "pauses",
+        "dead moment", "dead moments", "dead time", "boring", "dull", "filler",
+        "nothing happens", "uneventful",
+    )
+    targets: list[str] = []
+    for marker in ("cut out", "remove", "strip out"):
+        match = re.search(rf"{marker} (.+?)(?:$|[.;])", lowered_directive)
+        if not match:
+            continue
+        for part in re.split(r",| and ", match.group(1)):
+            phrase = part.strip()
+            for article in ("the ", "all ", "every ", "any "):
+                if phrase.startswith(article):
+                    phrase = phrase[len(article):]
+            phrase = phrase.strip()
+            if phrase and not any(term in phrase for term in mechanical):
+                targets.append(phrase)
+        break
+    return targets
 
 
 def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:

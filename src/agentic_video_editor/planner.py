@@ -14,6 +14,7 @@ from .intent import analyze_intent
 from .project import Project, utc_now
 from .retrieval import context_search
 from .structure import author_structure, expand_structure, intensity_to_weight, validate_ordering
+from .subtract import plan_subtraction
 
 
 # Fallback pacing ONLY for structures that omit intensity targets; the
@@ -223,6 +224,17 @@ def create_edit_plan(
         env_path=env_path,
         store=store,
     )
+    mode = intent["operation"]["mode"]
+    if mode == "subtract":
+        plan = plan_subtraction(project, intent, duration_sec=duration_sec)
+        if store:
+            _store_structured_plan(project, intent, plan, source)
+        return plan
+    casting_warnings: list[str] = []
+    if mode == "transform":
+        casting_warnings.append(
+            "transform mode is not implemented yet (revision lineage lands in a later phase); planning as compose"
+        )
     structure = author_structure(
         project,
         intent,
@@ -232,7 +244,6 @@ def create_edit_plan(
         env_path=env_path,
         store=store,
     )
-    casting_warnings: list[str] = []
     slots = expand_structure(structure, duration_sec=duration_sec)
     slots = _expand_generator_slots(project, slots, casting_warnings)
     _assign_slot_targets(slots, duration_sec)
