@@ -9,17 +9,6 @@ from .facets import observation_text
 from .project import Project
 
 
-ROLE_ALIASES = {
-    "archive": {"archive", "context", "character_detail"},
-    "studio": {"process", "performance", "context"},
-    "live": {"performance", "emotion", "payoff"},
-    "emotional": {"emotion", "reaction", "payoff"},
-    "payoff": {"payoff", "conclusion", "climax"},
-    "ending": {"payoff", "conclusion", "climax"},
-    "process": {"process", "context"},
-    "story": {"hook", "context", "process", "emotion", "payoff"},
-}
-
 STOP_TERMS = {
     "a",
     "an",
@@ -41,16 +30,22 @@ STOP_TERMS = {
 
 
 def context_search(project: Project, query: str, *, limit: int = 10) -> dict[str, Any]:
+    """Evidence-scoring search over indexed segments.
+
+    Scores on query-term hits across all serialized evidence (summaries,
+    cards, transcripts, word units, facet observations), a spoken-word bonus,
+    context-card presence, and existing quality scores. Editorial weighting
+    (which evidence matters for THIS directive) belongs to the QueryAgent,
+    which issues targeted sub-queries; this function stays directive-agnostic.
+    """
     with connect_db(project.db_path) as conn:
         migrate(conn)
         segments = _load_search_segments(conn)
         relationships = _load_relationships(conn)
 
-    intent = analyze_directive_intent(query)
-    profile = _weight_profile(intent)
     scored = []
     for segment in segments:
-        score, reasons = _score_segment(segment, query, intent, profile)
+        score, reasons = _score_segment(segment, query)
         if score > 0:
             scored.append((score, segment, reasons))
     if not scored:
@@ -70,8 +65,6 @@ def context_search(project: Project, query: str, *, limit: int = 10) -> dict[str
 
     return {
         "query": query,
-        "intent": intent,
-        "weight_profile": profile["name"],
         "packets": packets,
     }
 
@@ -120,38 +113,6 @@ def related_segments(project: Project, segment_id: str, *, limit: int = 10) -> d
             )
     related.sort(key=lambda item: float(item["confidence"] or 0), reverse=True)
     return {"segment_id": segment_id, "related": related[:limit]}
-
-
-def analyze_directive_intent(directive: str) -> dict[str, Any]:
-    terms = set(_directive_terms(directive))
-    desired_roles: list[str] = []
-    for term in terms:
-        desired_roles.extend(sorted(ROLE_ALIASES.get(term, set())))
-    for role in ["hook", "context", "process", "performance", "emotion", "payoff"]:
-        if role in terms:
-            desired_roles.append(role)
-    desired_roles = _dedupe(desired_roles)
-    if not desired_roles:
-        desired_roles = ["hook", "context", "performance", "emotion", "payoff"]
-
-    tone = []
-    for word in ["emotional", "high_energy", "intimate", "documentary", "archive", "musical"]:
-        if word in terms or word.replace("_", "") in terms:
-            tone.append(word)
-    implicit = []
-    if "documentary" in terms or "mini" in terms:
-        implicit.extend(["establish context before performance", "avoid unexplained clip pileups"])
-    if "payoff" in terms or "ending" in terms:
-        implicit.append("reserve the strongest resolution for the final beat")
-    if "archive" in terms and ("live" in terms or "studio" in terms):
-        implicit.append("bridge eras with captions or transition notes")
-
-    return {
-        "explicit_terms": sorted(terms),
-        "desired_story_roles": desired_roles,
-        "tone": tone,
-        "implicit_goals": _dedupe(implicit),
-    }
 
 
 def _load_search_segments(conn) -> list[dict[str, Any]]:
@@ -305,56 +266,31 @@ def _row(row) -> dict[str, Any]:
     return item
 
 
-WORD_DRIVEN_TERMS = {"words", "word", "story", "lyric", "lyrics", "spoken", "dialogue", "quote", "quotes", "talking", "says", "line", "lines", "interview"}
-
-VISUAL_DRIVEN_TERMS = {"montage", "visual", "visuals", "cinematic", "energy", "broll", "b_roll"}
-
-WEIGHT_PROFILES = {
-    "default": {"name": "default", "term": 2.0, "role_base": 3.0, "card": 1.5, "quality_cap": 2.0, "transcript_bonus": 0.0},
-    "word_driven": {"name": "word_driven", "term": 2.5, "role_base": 2.0, "card": 1.5, "quality_cap": 1.5, "transcript_bonus": 1.5},
-    "visual_driven": {"name": "visual_driven", "term": 2.0, "role_base": 4.0, "card": 1.5, "quality_cap": 2.5, "transcript_bonus": 0.0},
-}
+# Retrieval mechanics, not editorial vocabulary: how much a raw term hit,
+# a spoken-word hit, card presence, and quality contribute to evidence rank.
+TERM_WEIGHT = 2.0
+TRANSCRIPT_BONUS = 1.0
+TRANSCRIPT_BONUS_CAP = 3.0
+CARD_WEIGHT = 1.5
+QUALITY_CAP = 2.0
 
 
-def _weight_profile(intent: dict[str, Any]) -> dict[str, Any]:
-    terms = {_norm(term) for term in intent.get("explicit_terms") or []}
-    if terms & WORD_DRIVEN_TERMS:
-        return WEIGHT_PROFILES["word_driven"]
-    if terms & VISUAL_DRIVEN_TERMS:
-        return WEIGHT_PROFILES["visual_driven"]
-    return WEIGHT_PROFILES["default"]
-
-
-def _score_segment(
-    segment: dict[str, Any],
-    query: str,
-    intent: dict[str, Any],
-    profile: dict[str, Any] | None = None,
-) -> tuple[float, list[str]]:
-    profile = profile or WEIGHT_PROFILES["default"]
+def _score_segment(segment: dict[str, Any], query: str) -> tuple[float, list[str]]:
     query_terms = _directive_terms(query)
     text = _haystack(segment)
-    roles = {_norm(role) for role in segment["story_roles"]}
     score = 0.0
     reasons = []
 
     hits = [term for term in query_terms if term and term in text]
     if hits:
-        score += len(hits) * profile["term"]
+        score += len(hits) * TERM_WEIGHT
         reasons.append(f"matches directive terms: {', '.join(_dedupe(hits)[:5])}")
 
-    if profile["transcript_bonus"]:
-        transcript_text = _transcript_haystack(segment)
-        transcript_hits = [term for term in query_terms if term and term in transcript_text]
-        if transcript_hits:
-            score += min(3.0, len(transcript_hits) * profile["transcript_bonus"])
-            reasons.append(f"directive terms land in spoken words: {', '.join(_dedupe(transcript_hits)[:4])}")
-
-    desired_roles = {_norm(role) for role in intent.get("desired_story_roles", [])}
-    role_hits = sorted(roles & desired_roles)
-    if role_hits:
-        score += profile["role_base"] + len(role_hits)
-        reasons.append(f"story-role fit: {', '.join(role_hits)}")
+    transcript_text = _transcript_haystack(segment)
+    transcript_hits = [term for term in query_terms if term and term in transcript_text]
+    if transcript_hits:
+        score += min(TRANSCRIPT_BONUS_CAP, len(transcript_hits) * TRANSCRIPT_BONUS)
+        reasons.append(f"directive terms land in spoken words: {', '.join(_dedupe(transcript_hits)[:4])}")
 
     facet_text = _facet_haystack(segment)
     facet_hits = [term for term in query_terms if term and term in facet_text]
@@ -364,18 +300,14 @@ def _score_segment(
         reasons.append(f"facet observations match: {', '.join(_dedupe(facet_hits)[:4])}")
 
     if segment.get("context_card_id"):
-        score += profile["card"]
+        score += CARD_WEIGHT
         reasons.append("has editorial context card")
 
     quality = segment.get("select_score") or segment.get("quality_score") or 0
     try:
-        score += min(profile["quality_cap"], float(quality) / 5.0)
+        score += min(QUALITY_CAP, float(quality) / 5.0)
     except (TypeError, ValueError):
         pass
-
-    if "payoff" in roles and any(goal.startswith("reserve") for goal in intent.get("implicit_goals", [])):
-        score += 1.0
-        reasons.append("supports requested ending payoff")
 
     return score, reasons
 
@@ -423,8 +355,6 @@ def _packet(
         warnings.append("check_audio_transition")
     if not segment.get("context_card_id"):
         warnings.append("weak_context")
-    if "payoff" not in roles and "payoff" not in used_roles:
-        warnings.append("weak_ending_if_used_last")
 
     return {
         "segment_id": segment["id"],
@@ -450,27 +380,11 @@ def _packet(
             "facets": (segment.get("facets") or [])[:12],
         },
         "why_matches": reasons or ["high-scoring candidate from semantic analysis"],
-        "why_belongs_before_after": _placement_hint(segment),
         "relationship_expansion": [_relationship_packet(segment["id"], rel) for rel in rels[:5]],
         "caption_text": segment.get("caption_text"),
         "continuity_compatibility": _continuity_score(segment, rels, used_assets, used_roles),
         "warnings": _dedupe(warnings),
     }
-
-
-def _placement_hint(segment: dict[str, Any]) -> str:
-    roles = {_norm(role) for role in segment["story_roles"]}
-    if "payoff" in roles:
-        return "Belongs late, ideally after a clip that establishes context or escalation."
-    if "hook" in roles:
-        return "Belongs before context or process clips as an opening signal."
-    if "context" in roles or "archive" in roles:
-        return "Belongs before emotional/performance payoff so the viewer understands the stakes."
-    if "process" in roles:
-        return "Belongs after context and before higher-energy performance clips."
-    if "emotion" in roles:
-        return "Belongs after setup and before the final payoff."
-    return "Use between unlike clips when it improves visual or story variety."
 
 
 def _relationship_packet(segment_id: str, rel: dict[str, Any]) -> dict[str, Any]:
@@ -497,8 +411,6 @@ def _continuity_score(
         score -= 0.2
     if roles & used_roles:
         score -= 0.1
-    if "payoff" in roles:
-        score += 0.1
     return round(max(0.0, min(1.0, score)), 3)
 
 

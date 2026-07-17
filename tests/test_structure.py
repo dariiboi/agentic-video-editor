@@ -200,8 +200,6 @@ def test_structured_plan_end_to_end(tmp_path, run_ave):
         run_ave(
             "edit-plan",
             project_dir,
-            "--engine",
-            "structured",
             "--directive",
             "create a battle between green t-shirts and blue t-shirts",
             "--duration-sec",
@@ -249,8 +247,6 @@ def test_structured_plan_enumerate_supercut(tmp_path, run_ave):
         run_ave(
             "edit-plan",
             project_dir,
-            "--engine",
-            "structured",
             "--directive",
             'show every time someone says "love"',
             "--duration-sec",

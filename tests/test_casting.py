@@ -17,7 +17,7 @@ from agentic_video_editor.casting import (  # noqa: E402
     pair_features,
     resolve_anchors,
 )
-from agentic_video_editor.planner import create_structured_plan  # noqa: E402
+from agentic_video_editor.planner import create_edit_plan  # noqa: E402
 from agentic_video_editor.project import load_project  # noqa: E402
 
 
@@ -105,7 +105,7 @@ def test_anchor_resolution_pins_first_and_fails_loudly(tmp_path, run_ave):
     project = load_project(project_dir)
 
     # resolvable anchor pins the opening slot
-    plan = create_structured_plan(
+    plan = create_edit_plan(
         project,
         directive="open on the green t-shirt performer, then build a celebration",
         duration_sec=30,
@@ -118,7 +118,7 @@ def test_anchor_resolution_pins_first_and_fails_loudly(tmp_path, run_ave):
 
     # unresolvable user_explicit anchor fails the plan loudly
     with pytest.raises(AnchorResolutionError) as excinfo:
-        create_structured_plan(
+        create_edit_plan(
             project,
             directive="open on the purple dragon, then build a celebration",
             duration_sec=30,
@@ -131,8 +131,6 @@ def test_anchor_resolution_pins_first_and_fails_loudly(tmp_path, run_ave):
     result = run_ave(
         "edit-plan",
         project_dir,
-        "--engine",
-        "structured",
         "--directive",
         "open on the purple dragon, then build a celebration",
         "--provider",
@@ -163,7 +161,7 @@ def test_resolve_anchors_soft_anchor_skips_without_failure(tmp_path, run_ave):
 def test_novelty_penalty_and_motif_exemption(tmp_path, run_ave):
     project = load_project(_make_indexed_project(tmp_path, run_ave, clips=3))
 
-    plan = create_structured_plan(
+    plan = create_edit_plan(
         project,
         directive="create a battle between green t-shirts and blue t-shirts",
         duration_sec=60,
@@ -241,8 +239,6 @@ def test_end_to_end_plan_carries_casting_evidence(tmp_path, run_ave):
         run_ave(
             "edit-plan",
             project_dir,
-            "--engine",
-            "structured",
             "--directive",
             "create a battle between green t-shirts and blue t-shirts",
             "--duration-sec",

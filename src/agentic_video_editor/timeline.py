@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .cutpoints import anchor_trim, load_cut_points, snap_range
 from .db import connect_db, migrate
+from .gemini_provider import DEFAULT_MODEL
 from .planner import create_edit_plan
 from .project import Project, utc_now
 
@@ -28,6 +30,9 @@ def create_timeline(
     max_clip_sec: float = 12.0,
     context_aware: bool = False,
     snap_tolerance_sec: float = 1.0,
+    provider_name: str = "gemini",
+    model: str = DEFAULT_MODEL,
+    env_path: Path = Path(".gemini_api.env"),
 ) -> TimelineSummary:
     directive_id = f"directive_{uuid.uuid4().hex[:16]}"
     timeline_id = f"timeline_{uuid.uuid4().hex[:16]}"
@@ -35,7 +40,14 @@ def create_timeline(
     search_query = query or directive
     edit_plan: dict[str, Any] | None = None
     if context_aware:
-        edit_plan = create_edit_plan(project, directive=directive, duration_sec=duration_sec)
+        edit_plan = create_edit_plan(
+            project,
+            directive=directive,
+            duration_sec=duration_sec,
+            provider_name=provider_name,
+            model=model,
+            env_path=env_path,
+        )
 
     with connect_db(project.db_path) as conn:
         migrate(conn)
@@ -245,8 +257,8 @@ def _planned_items(conn, sequence: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "fps": asset.get("fps"),
                 "duration_sec": asset.get("duration_sec"),
                 "why_here": item["why_here"],
-                "before_context": item["before_context"],
-                "after_context": item["after_context"],
+                "before_context": item.get("before_context"),
+                "after_context": item.get("after_context"),
                 "caption_text": item.get("caption_text"),
                 "transition_note": item["transition_note"],
                 "continuity_score": item.get("continuity_score"),

@@ -16,7 +16,7 @@ from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .intent import analyze_intent, intent_markdown
 from .casting import AnchorResolutionError
-from .planner import create_edit_plan, create_structured_plan
+from .planner import create_edit_plan
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
 from .render import render_summary, render_timeline
@@ -235,17 +235,13 @@ def build_parser() -> argparse.ArgumentParser:
     related_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     related_parser.set_defaults(func=_related_command)
 
-    edit_plan_parser = subcommands.add_parser("edit-plan", help="Plan a context-aware rough cut")
+    edit_plan_parser = subcommands.add_parser(
+        "edit-plan", help="Plan an edit: IntentAgent -> StructureAgent -> cast -> compile"
+    )
     edit_plan_parser.add_argument("project_dir", type=Path)
     edit_plan_parser.add_argument("--directive", required=True)
     edit_plan_parser.add_argument("--duration-sec", type=float, default=60.0)
-    edit_plan_parser.add_argument(
-        "--engine",
-        default="legacy",
-        choices=["legacy", "structured"],
-        help="structured runs IntentAgent -> StructureAgent -> cast; legacy keeps the fixed-beat planner",
-    )
-    edit_plan_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"], help="Structured engine only")
+    edit_plan_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"])
     edit_plan_parser.add_argument("--model", default=DEFAULT_MODEL)
     edit_plan_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     edit_plan_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
@@ -257,7 +253,10 @@ def build_parser() -> argparse.ArgumentParser:
     timeline_parser.add_argument("--duration-sec", type=float, default=60.0)
     timeline_parser.add_argument("--query")
     timeline_parser.add_argument("--max-clip-sec", type=float, default=12.0)
-    timeline_parser.add_argument("--context-aware", action="store_true", help="Use editorial context planning")
+    timeline_parser.add_argument("--context-aware", action="store_true", help="Plan the timeline with the edit-plan engine")
+    timeline_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"], help="Agent provider for --context-aware planning")
+    timeline_parser.add_argument("--model", default=DEFAULT_MODEL)
+    timeline_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     timeline_parser.add_argument(
         "--snap-tolerance-sec",
         type=float,
@@ -727,25 +726,22 @@ def _structure_command(args: argparse.Namespace) -> int:
 
 def _edit_plan_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
-    if args.engine == "structured":
-        try:
-            data = create_structured_plan(
-                project,
-                directive=args.directive,
-                duration_sec=args.duration_sec,
-                provider_name=args.provider,
-                model=args.model,
-                env_path=args.env_path,
-            )
-        except AnchorResolutionError as exc:
-            payload = {"error": "anchor_resolution_failed", "failures": exc.failures}
-            if args.json:
-                print(json.dumps(payload, indent=2))
-            else:
-                print(f"Edit plan failed: {exc}")
-            return 1
-    else:
-        data = create_edit_plan(project, directive=args.directive, duration_sec=args.duration_sec)
+    try:
+        data = create_edit_plan(
+            project,
+            directive=args.directive,
+            duration_sec=args.duration_sec,
+            provider_name=args.provider,
+            model=args.model,
+            env_path=args.env_path,
+        )
+    except AnchorResolutionError as exc:
+        payload = {"error": "anchor_resolution_failed", "failures": exc.failures}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+        else:
+            print(f"Edit plan failed: {exc}")
+        return 1
     if args.json:
         print(json.dumps(data, indent=2))
     else:
@@ -765,6 +761,9 @@ def _timeline_command(args: argparse.Namespace) -> int:
         max_clip_sec=args.max_clip_sec,
         context_aware=args.context_aware,
         snap_tolerance_sec=args.snap_tolerance_sec,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
     )
     data = {
         "timeline_id": summary.timeline_id,

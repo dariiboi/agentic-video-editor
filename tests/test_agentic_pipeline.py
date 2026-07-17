@@ -65,6 +65,8 @@ def test_mock_context_build_search_plan_and_context_timeline(tmp_path, run_ave):
             "make a short performance montage with a payoff",
             "--duration-sec",
             "4",
+            "--provider",
+            "mock",
             "--json",
         )
     )
@@ -79,6 +81,8 @@ def test_mock_context_build_search_plan_and_context_timeline(tmp_path, run_ave):
             "--max-clip-sec",
             "2",
             "--context-aware",
+            "--provider",
+            "mock",
             "--json",
         )
     )
@@ -89,9 +93,10 @@ def test_mock_context_build_search_plan_and_context_timeline(tmp_path, run_ave):
     assert search["packets"]
     assert search["packets"][0]["why_matches"]
     assert "warnings" in search["packets"][0]
-    assert plan["beat_sheet"]
+    assert plan["structure"]["beats"]
     assert plan["selected_sequence"]
-    assert plan["caption_plan"]
+    assert plan["coverage_report"] is not None
+    assert all(item["why_here"] for item in plan["selected_sequence"])
     assert timeline["items_created"] >= 1
     first_item = shown["tracks"][0]["items"][0]
     assert first_item["why_here"]
@@ -171,6 +176,8 @@ def test_context_aware_timeline_falls_back_without_context_cards(tmp_path, run_a
             "--duration-sec",
             "2",
             "--context-aware",
+            "--provider",
+            "mock",
             "--json",
         )
     )

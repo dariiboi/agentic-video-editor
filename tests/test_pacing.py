@@ -6,24 +6,40 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from agentic_video_editor.cutpoints import anchor_trim  # noqa: E402
 from agentic_video_editor.planner import (  # noqa: E402
+    _assign_slot_targets,
     _assign_timing,
-    _beat_sheet,
     _fit_durations,
     _reserve_ending,
 )
-from agentic_video_editor.retrieval import _weight_profile, analyze_directive_intent  # noqa: E402
 from agentic_video_editor.semantics import _moment_range  # noqa: E402
 from agentic_video_editor.timeline import _assign_captions  # noqa: E402
 
 
-def test_beat_sheet_weights_payoff_longer_than_hook():
-    intent = {"desired_story_roles": ["hook", "context", "performance", "emotion", "payoff"]}
-    beats = _beat_sheet(intent, 60.0)
-    by_role = {beat["role"]: beat for beat in beats}
-    assert by_role["payoff"]["target_duration_sec"] > by_role["hook"]["target_duration_sec"]
-    assert abs(by_role["payoff"]["max_duration_sec"] - by_role["payoff"]["target_duration_sec"] * 2.0) < 0.01
-    assert by_role["hook"]["pacing"]["why"]
-    assert abs(sum(beat["target_duration_sec"] for beat in beats) - 60.0) < 1.0
+def test_role_pacing_fallback_lets_payoff_breathe_longer_than_hook():
+    # When a structure omits intensity targets, ROLE_PACING is the documented
+    # fallback: a payoff-function slot still gets more room than a hook slot.
+    slots = [
+        {"slot_id": "s1", "function": "hook", "intensity": None},
+        {"slot_id": "s2", "function": "context", "intensity": None},
+        {"slot_id": "s3", "function": "payoff", "intensity": None},
+    ]
+    _assign_slot_targets(slots, 60.0)
+    by_function = {slot["function"]: slot for slot in slots}
+    assert by_function["payoff"]["target_duration_sec"] > by_function["hook"]["target_duration_sec"]
+    assert "fallback" in by_function["hook"]["pacing_why"]
+    assert abs(sum(slot["target_duration_sec"] for slot in slots) - 60.0) < 1.0
+
+
+def test_intensity_overrides_role_pacing_fallback():
+    # An explicit intensity curve beats the fallback: a high-intensity
+    # "payoff"-named slot cuts shorter than a low-intensity one.
+    slots = [
+        {"slot_id": "s1", "function": "payoff", "intensity": 0.9},
+        {"slot_id": "s2", "function": "payoff", "intensity": 0.1},
+    ]
+    _assign_slot_targets(slots, 20.0)
+    assert slots[0]["target_duration_sec"] < slots[1]["target_duration_sec"]
+    assert "intensity target" in slots[0]["pacing_why"]
 
 
 def test_fit_durations_scales_proportionally_and_respects_caps():
@@ -113,16 +129,6 @@ def test_anchor_trim_noop_when_budget_covers_range():
     start, end, anchor = anchor_trim(5.0, 10.0, 6.0, [])
     assert (start, end) == (5.0, 10.0)
     assert anchor is None
-
-
-def test_weight_profiles_follow_directive_intent():
-    word = _weight_profile(analyze_directive_intent("a small story created thru words and lyrics"))
-    visual = _weight_profile(analyze_directive_intent("high energy visual montage"))
-    default = _weight_profile(analyze_directive_intent("a short documentary about the band"))
-    assert word["name"] == "word_driven"
-    assert visual["name"] == "visual_driven"
-    assert default["name"] == "default"
-    assert default["term"] == 2.0 and default["role_base"] == 3.0
 
 
 def test_assign_captions_honors_needs_caption_and_role_fallback():

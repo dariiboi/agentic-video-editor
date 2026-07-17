@@ -11,18 +11,12 @@ from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL
 from .intent import analyze_intent
 from .project import Project, utc_now
-from .retrieval import analyze_directive_intent, context_search
+from .retrieval import context_search
 from .structure import author_structure, expand_structure, intensity_to_weight, validate_ordering
 
 
-DEFAULT_BEATS = [
-    ("hook", "Open with an immediate subject/performance signal."),
-    ("context", "Give the viewer documentary context before stacking performances."),
-    ("process", "Show creative work, studio energy, or progression."),
-    ("emotion", "Deepen the cut with vulnerability, reaction, or expressive vocals."),
-    ("payoff", "End on the strongest musical or emotional resolution."),
-]
-
+# Fallback pacing ONLY for structures that omit intensity targets; the
+# structure document's intensity curve is the real pacing surface.
 ROLE_PACING = {
     "hook": {"weight": 0.8, "max_multiplier": 1.0, "why": "hooks cut fast to earn attention"},
     "reaction": {"weight": 0.8, "max_multiplier": 1.0, "why": "reactions are punctuation, keep them short"},
@@ -34,211 +28,6 @@ ROLE_PACING = {
 DEFAULT_PACING = {"weight": 1.0, "max_multiplier": 1.5, "why": "steady middle-of-cut pacing"}
 
 MIN_ENDING_SEC = 2.0
-
-NO_FORCED_ENDING_TERMS = {"trailer", "teaser", "loop", "looping", "cold_open", "cliffhanger"}
-
-
-def create_edit_plan(
-    project: Project,
-    *,
-    directive: str,
-    duration_sec: float = 60.0,
-    source: str = "context",
-    store: bool = True,
-) -> dict[str, Any]:
-    intent = analyze_directive_intent(directive)
-    beat_sheet = _beat_sheet(intent, duration_sec)
-    sequencing_policy = _sequencing_policy(project, intent, beat_sheet)
-    candidate_clips = []
-    selected_sequence = []
-    used_segments: set[str] = set()
-    used_assets: set[str] = set()
-
-    for index, beat in enumerate(beat_sheet):
-        query = f"{directive} {beat['role']} {beat['retrieval_hint']}"
-        search = context_search(project, query, limit=8)
-        candidates = search["packets"]
-        candidate_clips.append(
-            {
-                "beat_id": beat["id"],
-                "role": beat["role"],
-                "candidates": candidates,
-            }
-        )
-        selected = _select_for_beat(
-            beat["role"],
-            candidates,
-            used_segments,
-            used_assets,
-            prefer_new_asset=sequencing_policy["novelty_all_beats"] or index < 3,
-            min_duration_sec=MIN_ENDING_SEC if beat["role"] == "payoff" else None,
-        )
-        if selected:
-            used_segments.add(selected["segment_id"])
-            used_assets.add(selected["asset_id"])
-            selected_sequence.append(_sequence_item(beat, selected, len(selected_sequence), duration_sec))
-
-    if sequencing_policy["force_payoff_last"]:
-        selected_sequence = _ensure_payoff_last(project, directive, selected_sequence, used_segments)
-    _assign_timing(selected_sequence, duration_sec)
-    continuity_warnings = _continuity_warnings(selected_sequence)
-    plan = {
-        "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
-        "directive": directive,
-        "duration_target_sec": duration_sec,
-        "intent_analysis": intent,
-        "beat_sheet": beat_sheet,
-        "candidate_clips_per_beat": candidate_clips,
-        "selected_sequence": selected_sequence,
-        "caption_plan": [
-            {
-                "segment_id": item["segment_id"],
-                "timeline_start_sec": item["timeline_start_sec"],
-                "caption_text": item.get("caption_text"),
-            }
-            for item in selected_sequence
-            if item.get("caption_text")
-        ],
-        "sequencing_policy": sequencing_policy,
-        "continuity_warnings": continuity_warnings,
-    }
-    if store:
-        _store_plan(project, plan, source)
-    return plan
-
-
-def _beat_sheet(intent: dict[str, Any], duration_sec: float) -> list[dict[str, Any]]:
-    desired = intent.get("desired_story_roles") or []
-    roles = []
-    for role, _description in DEFAULT_BEATS:
-        if role in desired or not desired:
-            roles.append(role)
-    for role in desired:
-        if role not in roles and role in {"archive", "performance", "reaction"}:
-            roles.insert(max(1, len(roles) - 1), role)
-    if "payoff" not in roles:
-        roles.append("payoff")
-    if "hook" not in roles:
-        roles.insert(0, "hook")
-
-    roles = _dedupe(roles)
-    if len(roles) > 6:
-        non_payoff = [role for role in roles if role != "payoff"]
-        roles = non_payoff[:5] + ["payoff"]
-    if len(roles) < 3:
-        roles = ["hook", "context", "payoff"]
-    pacing_by_role = {role: ROLE_PACING.get(role, DEFAULT_PACING) for role in roles}
-    total_weight = sum(pacing_by_role[role]["weight"] for role in roles)
-    beats = []
-    for index, role in enumerate(roles):
-        description = dict(DEFAULT_BEATS).get(role, f"Use {role} material to serve the directive.")
-        pacing = pacing_by_role[role]
-        target = max(1.5, duration_sec * pacing["weight"] / total_weight)
-        beats.append(
-            {
-                "id": f"beat_{index + 1}",
-                "position": index + 1,
-                "role": role,
-                "description": description,
-                "target_duration_sec": round(target, 3),
-                "max_duration_sec": round(target * pacing["max_multiplier"], 3),
-                "pacing": {"weight": pacing["weight"], "why": pacing["why"]},
-                "retrieval_hint": _retrieval_hint(role),
-            }
-        )
-    return beats
-
-
-def _sequencing_policy(project: Project, intent: dict[str, Any], beat_sheet: list[dict[str, Any]]) -> dict[str, Any]:
-    terms = {_norm(term) for term in intent.get("explicit_terms") or []}
-    open_ended = bool(terms & NO_FORCED_ENDING_TERMS)
-    with connect_db(project.db_path) as conn:
-        migrate(conn)
-        row = conn.execute(
-            "select count(*) as count from assets where project_id = ? and ingest_status = ?",
-            ("default", "ready"),
-        ).fetchone()
-    asset_count = int(row["count"] or 0)
-    novelty_all = asset_count >= len(beat_sheet)
-    return {
-        "force_payoff_last": not open_ended,
-        "force_payoff_last_why": (
-            "directive suggests an open-ended form; keeping the cast order"
-            if open_ended
-            else "documentary-style directive; reserve a payoff for the ending"
-        ),
-        "novelty_all_beats": novelty_all,
-        "novelty_why": (
-            f"{asset_count} assets for {len(beat_sheet)} beats; prefer a fresh source at every beat"
-            if novelty_all
-            else f"only {asset_count} assets; allow source reuse after the opening beats"
-        ),
-    }
-
-
-def _retrieval_hint(role: str) -> str:
-    return {
-        "hook": "opening identity immediate clear",
-        "context": "archive backstory documentary setup",
-        "archive": "older footage context era",
-        "process": "studio creative process collaboration",
-        "performance": "live studio performance vocal energy",
-        "emotion": "emotional vulnerable expressive reaction",
-        "reaction": "reaction human response",
-        "payoff": "ending climax musical payoff resolution",
-    }.get(role, role)
-
-
-def _select_for_beat(
-    beat_role: str,
-    candidates: list[dict[str, Any]],
-    used_segments: set[str],
-    used_assets: set[str],
-    *,
-    prefer_new_asset: bool,
-    min_duration_sec: float | None = None,
-) -> dict[str, Any] | None:
-    fresh = [item for item in candidates if item["segment_id"] not in used_segments]
-    role_matched = [item for item in fresh if _role_matches_beat(item, beat_role)]
-    if role_matched:
-        fresh = role_matched
-    if beat_role != "payoff":
-        not_ending = [item for item in fresh if "save_for_ending" not in item.get("warnings", [])]
-        if not_ending:
-            fresh = not_ending
-    if min_duration_sec:
-        long_enough = [item for item in fresh if _trim_length(item) >= min_duration_sec]
-        if long_enough:
-            fresh = long_enough
-    if prefer_new_asset:
-        new_asset = [item for item in fresh if item["asset_id"] not in used_assets]
-        if new_asset:
-            return new_asset[0]
-    return fresh[0] if fresh else (candidates[0] if candidates else None)
-
-
-def _trim_length(packet: dict[str, Any]) -> float:
-    trim_start, trim_end = packet["trim_range"]
-    end = float(trim_end)
-    asset_duration = packet.get("asset_duration_sec")
-    if asset_duration:
-        end = min(end, float(asset_duration) - 0.05)
-    return max(0.0, end - float(trim_start))
-
-
-def _role_matches_beat(packet: dict[str, Any], beat_role: str) -> bool:
-    roles = {_norm(role) for role in packet.get("story_roles", [])}
-    acceptable = {
-        "hook": {"hook"},
-        "context": {"context", "archive", "character_detail"},
-        "archive": {"archive", "context", "character_detail"},
-        "process": {"process"},
-        "performance": {"performance"},
-        "emotion": {"emotion", "reaction"},
-        "reaction": {"reaction", "emotion"},
-        "payoff": {"payoff", "conclusion", "climax"},
-    }.get(beat_role, {beat_role})
-    return bool(roles & acceptable)
 
 
 def _sequence_item(beat: dict[str, Any], packet: dict[str, Any], index: int, duration_sec: float) -> dict[str, Any]:
@@ -278,42 +67,12 @@ def _sequence_item(beat: dict[str, Any], packet: dict[str, Any], index: int, dur
         "pacing": beat.get("pacing"),
         "story_roles": packet.get("story_roles", []),
         "why_here": _why_here(beat, packet),
-        "before_context": _before_context(beat["role"]),
-        "after_context": _after_context(beat["role"]),
         "caption_text": packet.get("caption_text"),
         "transition_note": _transition_note(index, beat["role"], packet),
         "continuity_score": packet.get("continuity_compatibility", 0.6),
         "warnings": packet.get("warnings", []),
         "source_evidence": packet.get("source_evidence", {}),
     }
-
-
-def _ensure_payoff_last(
-    project: Project,
-    directive: str,
-    selected_sequence: list[dict[str, Any]],
-    used_segments: set[str],
-) -> list[dict[str, Any]]:
-    if not selected_sequence:
-        return selected_sequence
-    last_roles = {_norm(role) for role in selected_sequence[-1].get("story_roles", [])}
-    if "payoff" in last_roles:
-        return selected_sequence
-    payoff_search = context_search(project, f"{directive} payoff ending climax resolution", limit=5)
-    for packet in payoff_search["packets"]:
-        if packet["segment_id"] not in used_segments:
-            selected_sequence[-1] = _sequence_item(
-                {
-                    "id": selected_sequence[-1]["beat_id"],
-                    "role": "payoff",
-                    "target_duration_sec": selected_sequence[-1]["duration_sec"],
-                },
-                packet,
-                selected_sequence[-1]["sequence_index"],
-                selected_sequence[-1]["duration_sec"],
-            )
-            break
-    return selected_sequence
 
 
 def _assign_timing(selected_sequence: list[dict[str, Any]], duration_sec: float, *, reserve_ending: bool = True) -> None:
@@ -407,60 +166,7 @@ def _continuity_warnings(selected_sequence: list[dict[str, Any]]) -> list[str]:
             warnings.append(f"Possible redundancy between {previous['segment_id']} and {current['segment_id']}.")
         if "check_audio_transition" in current.get("warnings", []):
             warnings.append(f"Check or crossfade audio into {current['segment_id']}.")
-    if selected_sequence:
-        last_roles = {_norm(role) for role in selected_sequence[-1].get("story_roles", [])}
-        if "payoff" not in last_roles:
-            warnings.append("Ending may be weak because the last selected clip is not payoff-tagged.")
     return _dedupe(warnings)
-
-
-def _store_plan(project: Project, plan: dict[str, Any], source: str) -> None:
-    now = utc_now()
-    directive_id = f"directive_{uuid.uuid4().hex[:16]}"
-    intent_id = f"intent_{uuid.uuid4().hex[:16]}"
-    with connect_db(project.db_path) as conn:
-        migrate(conn)
-        conn.execute(
-            """
-            insert into directives (id, project_id, text, duration_sec, mode, created_at)
-            values (?, ?, ?, ?, ?, ?)
-            """,
-            (directive_id, "default", plan["directive"], plan["duration_target_sec"], "edit_plan", now),
-        )
-        conn.execute(
-            """
-            insert into intent_analyses (
-                id, project_id, directive_id, directive_text, analysis_json, source, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                intent_id,
-                "default",
-                directive_id,
-                plan["directive"],
-                json.dumps(plan["intent_analysis"], sort_keys=True),
-                source,
-                now,
-            ),
-        )
-        conn.execute(
-            """
-            insert into edit_plans (
-                id, project_id, directive_id, intent_analysis_id, plan_json, source, created_at
-            )
-            values (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                plan["plan_id"],
-                "default",
-                directive_id,
-                intent_id,
-                json.dumps(plan, indent=2),
-                source,
-                now,
-            ),
-        )
 
 
 def _why_here(beat: dict[str, Any], packet: dict[str, Any]) -> str:
@@ -468,37 +174,12 @@ def _why_here(beat: dict[str, Any], packet: dict[str, Any]) -> str:
     return f"{beat['role']} beat: {reasons or packet['source_evidence'].get('summary', 'selected for the directive')}."
 
 
-def _before_context(role: str) -> str:
-    return {
-        "hook": "First impression; no prior setup required.",
-        "context": "Follows the hook to add documentary grounding.",
-        "archive": "Follows the hook to establish time, source, or history.",
-        "process": "Follows context so the creative action has meaning.",
-        "performance": "Follows setup or process to raise energy.",
-        "emotion": "Follows setup so vulnerability feels earned.",
-        "payoff": "Follows escalation and should feel like resolution.",
-    }.get(role, "Placed to support the surrounding beats.")
-
-
-def _after_context(role: str) -> str:
-    return {
-        "hook": "Should lead into context rather than another similar hook.",
-        "context": "Can lead into process, performance, or emotion.",
-        "archive": "Can bridge into current studio/performance footage.",
-        "process": "Can lead into performance or emotional payoff.",
-        "performance": "Can lead into emotion or final payoff.",
-        "emotion": "Can lead into payoff if the next clip resolves the feeling.",
-        "payoff": "Best used as the ending or final musical release.",
-    }.get(role, "Use the next clip to add contrast or escalation.")
-
-
 def _transition_note(index: int, role: str, packet: dict[str, Any]) -> str:
+    del role
     if index == 0:
         return "Open cleanly; establish the subject before adding context."
     if "check_audio_transition" in packet.get("warnings", []):
         return "Use a short crossfade or continuous bed to avoid a jarring music cut."
-    if role == "payoff":
-        return "Let the clip breathe; avoid cutting off the musical phrase."
     return "Bridge with a simple cut or caption if the source era/style changes."
 
 
@@ -513,10 +194,10 @@ def _dedupe(values: list[str]) -> list[str]:
     return result
 
 
-# --- Structured engine (IntentAgent -> StructureAgent -> cast -> compile) ----
+# --- The edit-plan engine (IntentAgent -> StructureAgent -> cast -> compile) --
 
 
-def create_structured_plan(
+def create_edit_plan(
     project: Project,
     *,
     directive: str,

@@ -11,8 +11,9 @@
 #   - ffmpeg/ffprobe on PATH
 #   - faster-whisper in the python env (local ASR; model downloads once)
 #   - qmd CLI (~/.local/bin/qmd) for embedding-based relationship mining
-#   - Gemini key in .gemini_api.env (ONLY needed for re-running semantic
-#     analysis / transcription; everything below runs without it)
+#   - Gemini key in .gemini_api.env (needed for semantic analysis /
+#     transcription re-runs AND the context-aware plan in step 4; add
+#     "--provider mock" to the timeline command for an offline smoke run)
 #
 # Pipeline map (module -> what it writes):
 #   ingest.py           -> assets
@@ -23,7 +24,7 @@
 #   semantics.py        -> segments, selects, relationships (Gemini)
 #   context.py          -> editorial_context_cards, caption_options
 #   qmd_bridge.py       -> qmd_cards/*.md, relationships(source=qmd)     [NEW]
-#   planner.py          -> edit_plans (beat sheet + selected sequence)
+#   planner.py          -> edit_plans (intent -> structure -> cast sequence)
 #   timeline.py         -> timelines, timeline_items (snaps to cut points) [NEW]
 #   render.py           -> renders/*.mp4 (micro fades, single loudnorm,
 #                          optional crossfades + burned captions)        [NEW]

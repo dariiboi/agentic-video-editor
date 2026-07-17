@@ -497,14 +497,11 @@ def _relationship_notes(segment_id: str, relationships: list[dict[str, Any]]) ->
 
 def _warnings_for_segment(segment: dict[str, Any], relationships: list[dict[str, Any]]) -> list[str]:
     warnings = []
-    roles = {_norm(role) for role in segment["story_roles"]}
     duration = float(segment["end_sec"] or 0) - float(segment["start_sec"] or 0)
     if duration > 30:
         warnings.append("long_segment_trim_needed")
     if segment.get("quality_score") is not None and float(segment["quality_score"]) < 0.5:
         warnings.append("weak_quality")
-    if "payoff" in roles:
-        warnings.append("save_for_ending")
     if not relationships:
         warnings.append("weak_context_links")
     return warnings
