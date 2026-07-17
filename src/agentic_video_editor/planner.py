@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .casting import AnchorResolutionError, cast_structure, resolve_anchors
 from .cutpoints import anchor_trim
 from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL
@@ -526,12 +527,10 @@ def create_structured_plan(
     source: str = "structured",
     store: bool = True,
 ) -> dict[str, Any]:
-    """Directive -> intent -> ad-hoc structure -> cast -> timing.
+    """Directive -> intent -> ad-hoc structure -> QueryAgent/CastingAgent -> timing.
 
-    Casting here is a BRIDGE: per-slot context_search plus a deterministic
-    selector, marked for replacement by the B7 QueryAgent/CastingAgent. The
-    structure authoring, expansion, intensity timing, and ordering validation
-    are the durable parts.
+    An unresolvable user_explicit anchor raises AnchorResolutionError after
+    storing a failed plan record — pinned content is never silently skipped.
     """
     intent = analyze_intent(
         project,
@@ -555,12 +554,43 @@ def create_structured_plan(
     slots = expand_structure(structure, duration_sec=duration_sec)
     slots = _expand_generator_slots(project, slots, casting_warnings)
     _assign_slot_targets(slots, duration_sec)
-    lane_filters = {lane["id"]: lane["casting_filter"] for lane in structure.get("lanes", [])}
-    items = _cast_slots_bridge(project, directive, slots, lane_filters, structure, duration_sec, casting_warnings)
+
+    anchor_resolution = resolve_anchors(project, intent)
+    for anchor in anchor_resolution["unresolved_soft"]:
+        casting_warnings.append(f"anchor {anchor['description']!r} skipped: {anchor['why']}")
+    if anchor_resolution["failures"]:
+        failed = {
+            "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
+            "engine": "structured",
+            "status": "failed_anchor_resolution",
+            "directive": directive,
+            "duration_target_sec": duration_sec,
+            "intent_analysis": intent,
+            "structure_id": structure.get("structure_id"),
+            "anchor_failures": anchor_resolution["failures"],
+            "selected_sequence": [],
+        }
+        if store:
+            _store_structured_plan(project, intent, failed, source)
+        raise AnchorResolutionError(anchor_resolution["failures"])
+
+    casting = cast_structure(
+        project,
+        intent,
+        structure,
+        slots,
+        anchors_resolved=anchor_resolution["resolved"],
+        provider_name=provider_name,
+        model=model,
+        env_path=env_path,
+        warnings=casting_warnings,
+    )
+    items = _decisions_to_items(casting["decisions"], structure, duration_sec)
     _assign_timing(items, duration_sec, reserve_ending=bool(structure["ending_policy"].get("reserve_ending", True)))
     plan = {
         "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
         "engine": "structured",
+        "status": "ok",
         "directive": directive,
         "duration_target_sec": duration_sec,
         "intent_analysis": intent,
@@ -568,14 +598,66 @@ def create_structured_plan(
         "structure": {key: value for key, value in structure.items() if key != "raw_response"},
         "expanded_slots": slots,
         "selected_sequence": items,
+        "coverage_report": casting["coverage_report"],
+        "anchors_resolved": [
+            {"description": anchor["description"], "position": anchor["position"], "segment_id": anchor["segment_id"]}
+            for anchor in anchor_resolution["resolved"]
+        ],
+        "sanctioned_reuse": casting["sanctioned_reuse"],
         "casting_warnings": casting_warnings,
         "ordering_violations": validate_ordering(structure, items),
         "continuity_warnings": _continuity_warnings(items),
-        "sequencing_note": "BRIDGE casting: context_search + deterministic selector; B7 replaces with QueryAgent/CastingAgent",
+        "sequencing_note": "QueryAgent/CastingAgent casting: facet-filtered packets, ID-only selection, code-enforced lanes/withhold/novelty",
     }
     if store:
         _store_structured_plan(project, intent, plan, source)
     return plan
+
+
+def _decisions_to_items(
+    decisions: list[dict[str, Any]],
+    structure: dict[str, Any],
+    duration_sec: float,
+) -> list[dict[str, Any]]:
+    """Assemble sequence items from casting decisions (shots share slot targets)."""
+    hints = structure.get("transition_policy_hints") or {}
+    shots_per_slot: dict[str, int] = {}
+    for decision in decisions:
+        slot_id = decision["slot"]["slot_id"]
+        shots_per_slot[slot_id] = max(shots_per_slot.get(slot_id, 0), decision["shot_index"] + 1)
+
+    items: list[dict[str, Any]] = []
+    for decision in decisions:
+        slot = decision["slot"]
+        packet = decision["packet"]
+        per_shot_target = slot["target_duration_sec"] / shots_per_slot[slot["slot_id"]]
+        beat = {
+            "id": slot["slot_id"],
+            "role": slot["function"],
+            "target_duration_sec": round(per_shot_target, 3),
+            "max_duration_sec": slot["max_duration_sec"],
+            "pacing": {"weight": slot["pacing_weight"], "why": slot["pacing_why"]},
+        }
+        item = _sequence_item(beat, packet, len(items), duration_sec)
+        item["slot_id"] = slot["slot_id"]
+        item["beat_id"] = slot["beat_id"]
+        item["lane"] = slot.get("lane")
+        item["intensity"] = slot.get("intensity")
+        item["motif"] = slot.get("motif")
+        item["withhold"] = slot.get("withhold") or []
+        item["recontextualizes"] = slot.get("recontextualizes")
+        item["anchor"] = slot.get("anchor")
+        item["why_here"] = _structured_why(slot, packet)
+        item["casting_why"] = decision["why"]
+        item["risks"] = decision["risks"]
+        item["alternates"] = decision["alternates"]
+        item["matched_via"] = decision["matched_via"]
+        item["pair_features_prev"] = decision["pair_features_prev"]
+        hint = hints.get(slot["function"])
+        if hint:
+            item["transition_note"] = f"{hint} (structure hint for {slot['function']})"
+        items.append(item)
+    return items
 
 
 def _expand_generator_slots(
@@ -626,128 +708,6 @@ def _assign_slot_targets(slots: list[dict[str, Any]], duration_sec: float) -> No
         target = max(1.5, duration_sec * slot["pacing_weight"] / total)
         slot["target_duration_sec"] = round(target, 3)
         slot["max_duration_sec"] = round(target * slot["max_multiplier"], 3)
-
-
-def _cast_slots_bridge(
-    project: Project,
-    directive: str,
-    slots: list[dict[str, Any]],
-    lane_filters: dict[str, str],
-    structure: dict[str, Any],
-    duration_sec: float,
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    """BRIDGE selector (B7 replaces): retrieval-ranked, lane-aware, motif-aware."""
-    items: list[dict[str, Any]] = []
-    used_segments: set[str] = set()
-    motif_registry: dict[str, dict[str, Any]] = {}
-    hints = structure.get("transition_policy_hints") or {}
-
-    for slot in slots:
-        packets = _slot_candidates(project, directive, slot, lane_filters, warnings)
-        if not packets:
-            warnings.append(f"slot {slot['slot_id']} uncast: no candidates")
-            slot.pop("preselected_packet", None)
-            continue
-        motif = slot.get("motif")
-        if motif and motif["occurrence"] > 1 and motif["slot"] in motif_registry:
-            packets = [motif_registry[motif["slot"]]]
-            warnings.append(
-                f"slot {slot['slot_id']} reuses motif {motif['slot']!r} material (sanctioned recurrence"
-                + (f": {motif['transform']}" if motif.get("transform") else "")
-                + ")"
-            )
-        shots = slot["fill"]["shots_min"] if slot.get("fill") else 1
-        shots = max(1, min(shots, len(packets)))
-        per_shot_target = slot["target_duration_sec"] / shots
-        for shot_index in range(shots):
-            packet = _pick_packet(packets, used_segments, shot_index, slot, warnings)
-            beat = {
-                "id": slot["slot_id"],
-                "role": slot["function"],
-                "target_duration_sec": round(per_shot_target, 3),
-                "max_duration_sec": slot["max_duration_sec"],
-                "pacing": {"weight": slot["pacing_weight"], "why": slot["pacing_why"]},
-            }
-            item = _sequence_item(beat, packet, len(items), duration_sec)
-            item["slot_id"] = slot["slot_id"]
-            item["beat_id"] = slot["beat_id"]
-            item["lane"] = slot.get("lane")
-            item["intensity"] = slot.get("intensity")
-            item["motif"] = motif
-            item["withhold"] = slot.get("withhold") or []
-            item["recontextualizes"] = slot.get("recontextualizes")
-            item["why_here"] = _structured_why(slot, packet)
-            hint = hints.get(slot["function"])
-            if hint:
-                item["transition_note"] = f"{hint} (structure hint for {slot['function']})"
-            items.append(item)
-            used_segments.add(packet["segment_id"])
-            if motif and motif["occurrence"] == 1 and motif["slot"] not in motif_registry:
-                motif_registry[motif["slot"]] = packet
-        slot.pop("preselected_packet", None)
-    return items
-
-
-def _slot_candidates(
-    project: Project,
-    directive: str,
-    slot: dict[str, Any],
-    lane_filters: dict[str, str],
-    warnings: list[str],
-) -> list[dict[str, Any]]:
-    if slot.get("preselected_packet"):
-        return [slot["preselected_packet"]]
-    lane_filter = lane_filters.get(slot["lane"] or "", "")
-    query = " ".join(
-        part
-        for part in (directive, lane_filter, slot["casting_filter"], slot["visual_need"], slot["word_need"])
-        if part
-    )
-    packets = context_search(project, query, limit=8)["packets"]
-    if slot["lane"] and lane_filter:
-        matched = [packet for packet in packets if _lane_matches(packet, lane_filter)]
-        if matched:
-            packets = matched
-        elif packets:
-            warnings.append(
-                f"slot {slot['slot_id']}: no candidate carries lane evidence for {lane_filter!r}; "
-                "casting unfiltered (BRIDGE approximation)"
-            )
-    return packets
-
-
-def _lane_matches(packet: dict[str, Any], lane_filter: str) -> bool:
-    """Approximate lane check: the filter's value terms must appear in the
-    packet's facet evidence (of the named facet type when one is given)."""
-    facet_name, _, value = lane_filter.partition(":")
-    if not value:
-        facet_name, value = "", lane_filter
-    facet_name = facet_name.strip().lower()
-    terms = [term for term in _norm(value).split("_") if len(term) > 1]
-    if not terms:
-        return True
-    haystack = " ".join(
-        f"{facet.get('text') or ''} {facet.get('evidence') or ''}".lower()
-        for facet in packet.get("source_evidence", {}).get("facets") or []
-        if not facet_name or str(facet.get("observation_type") or "").lower() == facet_name
-    )
-    return all(term in haystack for term in terms)
-
-
-def _pick_packet(
-    packets: list[dict[str, Any]],
-    used_segments: set[str],
-    shot_index: int,
-    slot: dict[str, Any],
-    warnings: list[str],
-) -> dict[str, Any]:
-    fresh = [packet for packet in packets if packet["segment_id"] not in used_segments]
-    if fresh:
-        return fresh[0]
-    packet = packets[shot_index % len(packets)]
-    warnings.append(f"slot {slot['slot_id']} reuses segment {packet['segment_id']} (corpus smaller than the structure)")
-    return packet
 
 
 def _structured_why(slot: dict[str, Any], packet: dict[str, Any]) -> str:

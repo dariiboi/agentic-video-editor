@@ -193,7 +193,7 @@ def test_mock_battle_structure_has_lanes_alternation_and_rising_intensity(tmp_pa
     assert {motif["occurrence"] for motif in motifs} == {1, 2}
 
 
-def test_structured_plan_end_to_end_bridge(tmp_path, run_ave):
+def test_structured_plan_end_to_end(tmp_path, run_ave):
     project_dir = _make_indexed_project(tmp_path, run_ave, clips=3)
 
     plan = _json(
@@ -230,7 +230,7 @@ def test_structured_plan_end_to_end_bridge(tmp_path, run_ave):
 
     # ordering violations are reported, not silently repaired
     assert plan["ordering_violations"] == []
-    assert "BRIDGE" in plan["sequencing_note"]
+    assert "QueryAgent/CastingAgent" in plan["sequencing_note"]
 
     # motif recurrence is a sanctioned, recorded reuse
     assert any("motif" in warning for warning in plan["casting_warnings"])

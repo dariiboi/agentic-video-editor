@@ -104,6 +104,9 @@ class MockProvider:
         structure_payload = _mock_structure_payload(prompt)
         if structure_payload is not None:
             return structure_payload
+        casting_payload = _mock_casting_payload(prompt)
+        if casting_payload is not None:
+            return casting_payload
         return {}
 
     @contextmanager
@@ -547,6 +550,28 @@ def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
         "juxtaposition_rules": [],
         "transition_policy_hints": {},
         "ending_policy": {"intent": "land the ending", "reserve_ending": True},
+    }
+
+
+def _mock_casting_payload(prompt: str) -> dict[str, Any] | None:
+    """Deterministic canned CastingAgent reply.
+
+    Candidates arrive pre-filtered and pre-ranked by code (lane, withhold,
+    novelty), so the mock simply picks the top-ranked candidate — the same
+    behavior the deterministic bridge had, keeping offline plans sensible.
+    """
+    if "CASTING_AGENT" not in prompt:
+        return None
+    ids = re.findall(r"^- \[(\S+) \|", prompt, flags=re.M)
+    if not ids:
+        return {}
+    function_match = re.search(r"function=(\S+)", prompt)
+    function = function_match.group(1) if function_match else "the slot"
+    return {
+        "selected": ids[0],
+        "alternates": ids[1:3],
+        "why": f"top-ranked candidate satisfying the filters for {function}",
+        "risks": [],
     }
 
 

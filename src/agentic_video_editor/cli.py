@@ -15,6 +15,7 @@ from .facets import FACETS, facet_analyze_project, facet_search, facet_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .intent import analyze_intent, intent_markdown
+from .casting import AnchorResolutionError
 from .planner import create_edit_plan, create_structured_plan
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
@@ -727,14 +728,22 @@ def _structure_command(args: argparse.Namespace) -> int:
 def _edit_plan_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
     if args.engine == "structured":
-        data = create_structured_plan(
-            project,
-            directive=args.directive,
-            duration_sec=args.duration_sec,
-            provider_name=args.provider,
-            model=args.model,
-            env_path=args.env_path,
-        )
+        try:
+            data = create_structured_plan(
+                project,
+                directive=args.directive,
+                duration_sec=args.duration_sec,
+                provider_name=args.provider,
+                model=args.model,
+                env_path=args.env_path,
+            )
+        except AnchorResolutionError as exc:
+            payload = {"error": "anchor_resolution_failed", "failures": exc.failures}
+            if args.json:
+                print(json.dumps(payload, indent=2))
+            else:
+                print(f"Edit plan failed: {exc}")
+            return 1
     else:
         data = create_edit_plan(project, directive=args.directive, duration_sec=args.duration_sec)
     if args.json:

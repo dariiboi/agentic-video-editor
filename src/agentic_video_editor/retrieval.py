@@ -249,6 +249,7 @@ def _attach_facets(conn, segments: list[dict[str, Any]]) -> None:
             value = {}
         item["text"] = observation_text(value, include_evidence=False)
         item["evidence"] = str(value.get("evidence") or "")
+        item["parsed_value"] = value
         by_asset[item["asset_id"]].append(item)
     for segment in segments:
         segment["facets"] = [
@@ -257,6 +258,7 @@ def _attach_facets(conn, segments: list[dict[str, Any]]) -> None:
                 "time_range": [obs["start_sec"], obs["end_sec"]],
                 "text": obs["text"],
                 "evidence": obs["evidence"],
+                "value": obs["parsed_value"],
             }
             for obs in by_asset.get(segment["asset_id"], [])
             if obs["start_sec"] < segment["end_sec"] and segment["start_sec"] < obs["end_sec"]
