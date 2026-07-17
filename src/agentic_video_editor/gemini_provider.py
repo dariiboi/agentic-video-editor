@@ -145,7 +145,7 @@ class MockProvider:
                     "story_roles": ["hook"],
                     "story_function": "setup",
                     "setup_questions": ["who is performing"],
-                    "payoff_answers": [],
+                    "payoff_answers": ["the performer from the opening is revealed"],
                     "audio_affordance": "music_bed",
                     "visual_affordance": "performance",
                     "needs_caption": False,
@@ -367,9 +367,15 @@ def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
         base["edit_type"] = "revision"
         return base
 
-    if "battle between" in lowered:
+    battle = re.search(r"battle between (.+?) and (.+?)(?:$|[,.;])", lowered)
+    if battle:
+        faction_a, faction_b = battle.group(1).strip(), battle.group(2).strip()
         base["edit_type"] = "faction_battle"
-        base["evidence_attributes"] = ["t-shirt color", "team membership", "confrontational action"]
+        attributes = [faction_a, faction_b]
+        if "t-shirt" in lowered:
+            attributes += ["t-shirt color", "team membership"]
+        attributes.append("confrontational action")
+        base["evidence_attributes"] = attributes
         base["requirements"] = [
             {"text": directive, "provenance": "user_explicit", "why": None},
             {
@@ -389,6 +395,49 @@ def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
             "casting_accuracy": 0.2,
             "ending": 0.2,
         }
+        return base
+
+    if "trailer" in lowered or "teaser" in lowered:
+        base["edit_type"] = "teaser_trailer"
+        base["requirements"].append(
+            {
+                "text": "open hot and end on a sting; no documentary wind-down",
+                "provenance": "user_implicit",
+                "why": "a trailer sells the peak, it does not resolve it",
+            }
+        )
+        return base
+
+    if "story" in lowered and "word" in lowered:
+        base["edit_type"] = "word_story"
+        base["evidence_attributes"] = ["quotable spoken lines"]
+        base["requirements"].append(
+            {
+                "text": "the storyline must ride verbatim spoken lines, quoted with their timestamps",
+                "provenance": "user_implicit",
+                "why": "a story told through words needs the words themselves as the spine",
+            }
+        )
+        return base
+
+    if "documentary" in lowered:
+        base["edit_type"] = "mini_documentary"
+        return base
+
+    if "bookend" in lowered:
+        base["edit_type"] = "bookend_piece"
+        return base
+
+    if any(marker in lowered for marker in ("memory", "fading", "elegy", "tribute")):
+        base["edit_type"] = "elegy"
+        return base
+
+    if "reveal" in lowered:
+        base["edit_type"] = "reveal_piece"
+        return base
+
+    if "tension" in lowered:
+        base["edit_type"] = "tension_build"
         return base
 
     if len(lowered.split()) <= 6 and not anchors:
@@ -441,6 +490,37 @@ def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
             "why": "target duration supplied with the request",
         }
     }
+
+    faction_a, faction_b = _mock_faction_attributes(prompt) if edit_type == "faction_battle" else ("", "")
+    if edit_type == "faction_battle" and "t-shirt" not in f"{faction_a} {faction_b}":
+        # generic factions: lanes derived from the brief's evidence attributes,
+        # so a "red hats vs top hats" ask casts against red hats, not t-shirts
+        lane_a, lane_b = faction_a.split()[0], faction_b.split()[0]
+        return {
+            "logline": f"{faction_a} and {faction_b} trade escalating moves until they collide.",
+            "constraints_ack": duration_ack,
+            "lanes": [
+                {"id": lane_a, "casting_filter": f"people_appearance: {faction_a}"},
+                {"id": lane_b, "casting_filter": f"people_appearance: {faction_b}"},
+            ],
+            "beats": [
+                {"id": "g1", "function": "meet_faction", "lane": lane_a, "intensity_target": 0.35},
+                {"id": "g2", "function": "meet_faction", "lane": lane_b, "intensity_target": 0.35},
+                {
+                    "id": "g3-g6",
+                    "pattern": "alternate",
+                    "lanes": [lane_a, lane_b],
+                    "function": "trade_blows",
+                    "intensity_target": [0.45, 0.9],
+                },
+                {"id": "g7", "function": "collision", "lane": None, "intensity_target": 1.0},
+                {"id": "g8", "function": "aftermath", "intensity_target": 0.25},
+            ],
+            "ordering_constraints": [{"type": "before", "a": "g1", "b": "g7"}],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {"trade_blows": "hard cuts only"},
+            "ending_policy": {"intent": "aftermath, not a winner card", "reserve_ending": True},
+        }
 
     if edit_type == "faction_battle":
         return {
@@ -519,9 +599,168 @@ def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
             "ending_policy": {"intent": "end on the last occurrence", "reserve_ending": False},
         }
 
-    if edit_type == "footage_first_pitch":
+    if edit_type == "teaser_trailer":
         return {
-            "logline": "Pitched from the corpus profile: the strongest indexed moments, threaded as one build.",
+            "logline": "Flashes, a promise, a title, a sting — sell it, don't resolve it.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "t1", "function": "cold_flash", "intensity_target": 0.9, "visual_need": "the single most arresting instant"},
+                {"id": "t2", "function": "whisper_of_premise", "intensity_target": 0.45, "word_need": "one intriguing line, unfinished"},
+                {"id": "t3", "pattern": "repeat", "count": 3, "function": "flash_cluster", "intensity_target": [0.7, 0.95]},
+                {"id": "t4", "function": "title_hit", "intensity_target": 0.5, "visual_need": "on-screen text or logo moment"},
+                {"id": "t5", "function": "sting", "intensity_target": 0.9},
+            ],
+            "ordering_constraints": [],
+            "juxtaposition_rules": ["hard contrast between adjacent flashes"],
+            "transition_policy_hints": {"flash_cluster": "hard cuts only", "sting": "hard out"},
+            "ending_policy": {"intent": "end on the sting, no wind-down", "reserve_ending": False},
+        }
+
+    if edit_type == "word_story":
+        quotes = _mock_quotable_lines(prompt)
+        first = quotes[0]["text"] if quotes else "a spoken line"
+        return {
+            "logline": f'A story that rides the line "{first}".',
+            "constraints_ack": duration_ack,
+            "word_spine": quotes,
+            "lanes": [],
+            "beats": [
+                {
+                    "id": "w1",
+                    "function": "declare_thesis",
+                    "intensity_target": 0.45,
+                    "word_need": f'the line "{first}", heard clean',
+                    "motif": {"slot": "line", "occurrence": 1},
+                },
+                {"id": "w2", "function": "complicate", "intensity_target": 0.6, "word_need": "a line that pushes against the thesis"},
+                {
+                    "id": "w3",
+                    "function": "echo_the_line",
+                    "intensity_target": 0.5,
+                    "word_need": f'the line "{first}" returning changed',
+                    "motif": {"slot": "line", "occurrence": 2, "transform": "tighter"},
+                },
+                {"id": "w4", "function": "resolve_in_words", "intensity_target": 0.3, "word_need": "a line that lands the ending"},
+            ],
+            "ordering_constraints": [{"type": "before", "a": "w1", "b": "w4"}],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "end on the resolving line", "reserve_ending": True},
+        }
+
+    if edit_type == "mini_documentary":
+        return {
+            "logline": "Ground the place, meet the person, watch the work, learn the cost, land it.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "m1", "function": "arrive_in_the_place", "intensity_target": 0.35, "visual_need": "establishing setting"},
+                {"id": "m2", "function": "meet_the_person", "intensity_target": 0.4},
+                {"id": "m3", "function": "the_work_itself", "intensity_target": 0.55},
+                {"id": "m4", "function": "what_it_costs", "intensity_target": 0.45},
+                {"id": "m5", "function": "where_it_lands", "intensity_target": 0.25},
+            ],
+            "ordering_constraints": [{"type": "before", "a": "m1", "b": "m5"}],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "resolution earned by the grounding", "reserve_ending": True},
+        }
+
+    if edit_type == "bookend_piece":
+        return {
+            "logline": "Plant an image, wander away, return to it changed.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "o1", "function": "plant_image", "intensity_target": 0.35, "motif": {"slot": "frame", "occurrence": 1}},
+                {"id": "o2", "function": "wander", "intensity_target": 0.55},
+                {"id": "o3", "function": "gather", "intensity_target": 0.65},
+                {
+                    "id": "o4",
+                    "function": "return_image",
+                    "intensity_target": 0.85,
+                    "motif": {"slot": "frame", "occurrence": 2, "transform": "shorter, now a farewell"},
+                },
+            ],
+            "ordering_constraints": [{"type": "before", "a": "o1", "b": "o4"}],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "close on the returned image", "reserve_ending": False},
+        }
+
+    if edit_type == "elegy":
+        return {
+            "logline": "Hold the light, notice the small things, let them fade, let go.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "e1", "function": "hold_the_light", "intensity_target": 0.5},
+                {"id": "e2", "function": "small_details", "intensity_target": 0.6},
+                {"id": "e3", "pattern": "repeat", "count": 2, "function": "the_fade", "intensity_target": [0.5, 0.3]},
+                {
+                    "id": "e4",
+                    "function": "let_go",
+                    "intensity_target": 0.1,
+                    "word_need": "a vulnerable line",
+                    "casting_filter": "emotion_tone: grin",
+                },
+            ],
+            "ordering_constraints": [],
+            "juxtaposition_rules": ["soften contrasts as the piece fades"],
+            "transition_policy_hints": {"the_fade": "allow dissolve", "let_go": "allow a long dissolve"},
+            "ending_policy": {"intent": "a long held goodbye", "reserve_ending": True},
+        }
+
+    if edit_type == "reveal_piece":
+        return {
+            "logline": "Show it innocent, drift, then show what it really was.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "r1", "function": "innocent_open", "intensity_target": 0.4, "visual_need": "the moment as it first reads"},
+                {"id": "r2", "function": "drift", "intensity_target": 0.5},
+                {
+                    "id": "r3",
+                    "function": "the_reveal",
+                    "intensity_target": 0.75,
+                    "recontextualizes": "r1",
+                    "visual_need": "the evidence that reframes the opening",
+                },
+                {"id": "r4", "function": "sit_with_it", "intensity_target": 0.2},
+            ],
+            "ordering_constraints": [{"type": "before", "a": "r1", "b": "r3"}],
+            "juxtaposition_rules": [],
+            "transition_policy_hints": {},
+            "ending_policy": {"intent": "let the reframe settle", "reserve_ending": True},
+        }
+
+    if edit_type == "tension_build":
+        return {
+            "logline": "One continuous tightening, no relief until it breaks.",
+            "constraints_ack": duration_ack,
+            "lanes": [],
+            "beats": [
+                {"id": "t1", "function": "ignition", "intensity_target": 0.3},
+                {"id": "t2", "pattern": "repeat", "count": 5, "function": "tighten", "intensity_target": [0.4, 0.95]},
+                {"id": "t3", "function": "detonation", "intensity_target": 1.0},
+            ],
+            "ordering_constraints": [{"type": "before", "a": "t1", "b": "t3"}],
+            "juxtaposition_rules": ["each cut should feel closer than the last"],
+            "transition_policy_hints": {"tighten": "hard cuts only"},
+            "ending_policy": {"intent": "end at the break", "reserve_ending": False},
+        }
+
+    if edit_type == "footage_first_pitch":
+        assets_line = re.search(r"- (\d+) ready asset\(s\), ([\d.]+)s total", prompt)
+        top_term = re.search(r"- people_appearance \(\d+\): ([^(]+?) \(", prompt)
+        cited = []
+        if assets_line:
+            cited.append(f"{assets_line.group(1)} clip(s), {assets_line.group(2)}s of footage")
+        if top_term:
+            cited.append(f"strongest visual thread '{top_term.group(1).strip()}'")
+        return {
+            "logline": f"Pitched from the index ({'; '.join(cited) or 'profile empty'}): the strongest moments, threaded as one build.",
             "constraints_ack": duration_ack,
             "lanes": [],
             "beats": [
@@ -551,6 +790,25 @@ def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
         "transition_policy_hints": {},
         "ending_policy": {"intent": "land the ending", "reserve_ending": True},
     }
+
+
+def _mock_faction_attributes(prompt: str) -> tuple[str, str]:
+    """First two faction phrases from the brief's evidence_attributes JSON."""
+    match = re.search(r'"evidence_attributes": \[(.*?)\]', prompt, flags=re.S)
+    entries = re.findall(r'"([^"]+)"', match.group(1)) if match else []
+    generic = {"t-shirt color", "team membership", "confrontational action"}
+    factions = [entry for entry in entries if entry not in generic]
+    factions += ["side a", "side b"]
+    return factions[0], factions[1]
+
+
+def _mock_quotable_lines(prompt: str) -> list[dict[str, Any]]:
+    """Quote-spans-back: verbatim lines from the profile's Quotable lines section."""
+    matches = re.findall(r'^- "(.+)" \[(\S+) ([\d.]+)-([\d.]+)\]$', prompt, flags=re.M)
+    return [
+        {"text": text, "file_name": file_name, "start_sec": float(start), "end_sec": float(end)}
+        for text, file_name, start, end in matches[:4]
+    ]
 
 
 def _mock_casting_payload(prompt: str) -> dict[str, Any] | None:

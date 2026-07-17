@@ -44,6 +44,7 @@ Return JSON only:
 {{
   "logline": string,
   "constraints_ack": {{"<name>": {{"value": any, "provenance": string, "why": string}}}},
+  "word_spine": [{{"text": string, "start_sec": number, "end_sec": number, "file_name": string}}],
   "lanes": [{{"id": string, "casting_filter": string}}],
   "beats": [
     {{
@@ -90,6 +91,9 @@ Rules:
   "recontextualizes" marks a beat cast to change the meaning of an earlier one.
 - enumerate beats generate one slot per match of from_query (this is how
   supercuts and inventories fall out of the same schema).
+- For word-driven directives, word_spine quotes the carrying lines VERBATIM
+  from the Quotable lines section with their exact timestamps; never invent or
+  round a timestamp. Omit word_spine when the directive is not word-driven.
 - Echo every hard constraint you are honoring in constraints_ack with its
   provenance; never relabel a user_explicit constraint.
 - Only cast against evidence the footage index plausibly holds; the brief's
@@ -175,6 +179,7 @@ def _validate_structure(raw: Any, intent: dict[str, Any], duration_sec: float) -
     structure = {
         "logline": str(raw.get("logline") or "").strip() or "(no logline returned)",
         "constraints_ack": _norm_constraints_ack(raw.get("constraints_ack"), intent, warnings),
+        "word_spine": _norm_word_spine(raw.get("word_spine"), warnings),
         "lanes": lanes,
         "beats": beats,
         "ordering_constraints": _norm_ordering(raw.get("ordering_constraints"), beat_ids, warnings),
@@ -204,6 +209,7 @@ def _fallback_structure(intent: dict[str, Any], duration_sec: float, warning: st
     return {
         "logline": f"Linear fallback for: {intent.get('directive') or 'the directive'}",
         "constraints_ack": dict(intent.get("hard_constraints") or {}),
+        "word_spine": [],
         "lanes": [],
         "beats": beats,
         "ordering_constraints": [],
@@ -326,6 +332,29 @@ def _norm_motif(raw: Any, beat_id: str, warnings: list[str]) -> dict[str, Any] |
         "occurrence": _int_or_none(raw.get("occurrence")) or 1,
         "transform": str(raw.get("transform") or "").strip() or None,
     }
+
+
+def _norm_word_spine(raw: Any, warnings: list[str]) -> list[dict[str, Any]]:
+    """Verbatim quoted spans with timestamps; entries missing either are dropped.
+
+    Evidence pass-through, not an executable primitive: casting and the why
+    trail consume it, the compiler never branches on it.
+    """
+    spine = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not str(item.get("text") or "").strip():
+            warnings.append("dropped a word-spine entry without text")
+            continue
+        try:
+            start, end = float(item["start_sec"]), float(item["end_sec"])
+        except (KeyError, TypeError, ValueError):
+            warnings.append(f"dropped word-spine entry {str(item.get('text'))[:32]!r} without timestamps")
+            continue
+        entry: dict[str, Any] = {"text": str(item["text"]).strip(), "start_sec": start, "end_sec": end}
+        if item.get("file_name"):
+            entry["file_name"] = str(item["file_name"]).strip()
+        spine.append(entry)
+    return spine
 
 
 def _norm_constraints_ack(raw: Any, intent: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
@@ -546,6 +575,12 @@ def structure_markdown(structure: dict[str, Any]) -> str:
     lines = [f"Logline: {structure['logline']}"]
     if structure.get("fallback"):
         lines.append("(fallback structure: the agent reply was malformed)")
+    if structure.get("word_spine"):
+        lines.append("")
+        lines.append("Word spine:")
+        for entry in structure["word_spine"]:
+            where = f" [{entry.get('file_name', '?')} {entry['start_sec']:.2f}-{entry['end_sec']:.2f}]"
+            lines.append(f'- "{entry["text"]}"{where}')
     if structure.get("lanes"):
         lines.append("")
         lines.append("Lanes:")

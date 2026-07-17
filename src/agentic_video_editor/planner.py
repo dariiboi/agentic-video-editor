@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Any
 
-from .casting import AnchorResolutionError, cast_structure, resolve_anchors
+from .casting import AnchorResolutionError, _packet_tokens, _terms, cast_structure, resolve_anchors
 from .cutpoints import anchor_trim
 from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL
@@ -266,7 +267,7 @@ def create_edit_plan(
         env_path=env_path,
         warnings=casting_warnings,
     )
-    items = _decisions_to_items(casting["decisions"], structure, duration_sec)
+    items = _decisions_to_items(casting["decisions"], structure, duration_sec, casting_warnings)
     _assign_timing(items, duration_sec, reserve_ending=bool(structure["ending_policy"].get("reserve_ending", True)))
     plan = {
         "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
@@ -299,6 +300,7 @@ def _decisions_to_items(
     decisions: list[dict[str, Any]],
     structure: dict[str, Any],
     duration_sec: float,
+    warnings: list[str],
 ) -> list[dict[str, Any]]:
     """Assemble sequence items from casting decisions (shots share slot targets)."""
     hints = structure.get("transition_policy_hints") or {}
@@ -338,6 +340,7 @@ def _decisions_to_items(
         if hint:
             item["transition_note"] = f"{hint} (structure hint for {slot['function']})"
         items.append(item)
+    _link_recontextualizations(items, decisions, warnings)
     return items
 
 
@@ -353,23 +356,94 @@ def _expand_generator_slots(
         if not generator:
             expanded.append(slot)
             continue
-        packets = context_search(project, generator["from_query"], limit=int(generator["cap"]))["packets"]
-        packets = packets[: int(generator["cap"])]
+        cap = int(generator["cap"])
+        packets = context_search(project, generator["from_query"], limit=max(24, cap * 3))["packets"]
+        packets, match_terms = _generator_matches(generator["from_query"], packets)
+        packets = packets[:cap]
         if generator.get("order") == "chronological":
             packets.sort(key=lambda packet: (packet["file_name"], float(packet["trim_range"][0])))
         if not packets:
-            warnings.append(f"slot {slot['slot_id']} uncast: no matches for {generator['from_query']!r}")
+            warnings.append(f"slot {slot['slot_id']} uncast: no evidence matches {generator['from_query']!r}")
             continue
         for index, packet in enumerate(packets):
             concrete = dict(slot)
             concrete["slot_id"] = f"{slot['beat_id']}#{index + 1}"
             concrete["generator"] = None
             concrete["generated_from"] = generator["from_query"]
+            concrete["generated_match"] = sorted(match_terms)
             concrete["preselected_packet"] = packet
             expanded.append(concrete)
     for position, slot in enumerate(expanded):
         slot["position"] = position
     return expanded
+
+
+def _generator_matches(
+    from_query: str,
+    packets: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Enumerate beats keep only packets whose evidence actually matches.
+
+    A quoted phrase must appear in full; otherwise any content term counts.
+    Retrieval's zero-score fallback never qualifies — a supercut of noise is
+    worse than an honest "no matches".
+    """
+    quoted = re.search(r"['\"]([^'\"]+)['\"]", from_query)
+    if quoted:
+        required = _terms(quoted.group(1))
+        need_all = True
+    else:
+        required = {term for term in _terms(from_query) if len(term) > 2}
+        need_all = False
+    if not required:
+        return packets, set()
+    kept = []
+    for packet in packets:
+        tokens = _packet_tokens(packet)
+        if (need_all and required <= tokens) or (not need_all and required & tokens):
+            kept.append(packet)
+    return kept, required
+
+
+def _link_recontextualizations(
+    items: list[dict[str, Any]],
+    decisions: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """Attach the linking evidence for reveal pairs; absence is flagged, not hidden."""
+    packets_by_segment: dict[str, dict[str, Any]] = {}
+    for decision in decisions:
+        packets_by_segment.setdefault(decision["packet"]["segment_id"], decision["packet"])
+    first_by_beat: dict[str, dict[str, Any]] = {}
+    for item in items:
+        first_by_beat.setdefault(item["beat_id"], item)
+    for item in items:
+        target = item.get("recontextualizes")
+        if not target:
+            continue
+        earlier = first_by_beat.get(target)
+        if not earlier or earlier["sequence_index"] >= item["sequence_index"]:
+            warnings.append(f"item {item['slot_id']} recontextualizes {target!r} but no earlier cast item exists")
+            continue
+        packet = packets_by_segment.get(item["segment_id"], {})
+        edges = [
+            rel
+            for rel in packet.get("relationship_expansion") or []
+            if rel.get("segment_id") == earlier["segment_id"]
+        ]
+        link = {
+            "of_beat": target,
+            "earlier_segment_id": earlier["segment_id"],
+            "earlier_setup_questions": earlier.get("source_evidence", {}).get("setup_questions") or [],
+            "payoff_answers": item.get("source_evidence", {}).get("payoff_answers") or [],
+            "relationship_edges": edges,
+        }
+        item["recontextualization_link"] = link
+        if not (link["earlier_setup_questions"] or link["payoff_answers"] or edges):
+            warnings.append(
+                f"item {item['slot_id']} recontextualizes {target} but no setup/payoff "
+                "or relationship evidence links the pair"
+            )
 
 
 def _assign_slot_targets(slots: list[dict[str, Any]], duration_sec: float) -> None:

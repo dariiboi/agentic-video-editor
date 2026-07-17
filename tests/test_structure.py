@@ -248,7 +248,7 @@ def test_structured_plan_enumerate_supercut(tmp_path, run_ave):
             "edit-plan",
             project_dir,
             "--directive",
-            'show every time someone says "love"',
+            'show every time someone says "opening"',
             "--duration-sec",
             "30",
             "--provider",
@@ -259,7 +259,7 @@ def test_structured_plan_enumerate_supercut(tmp_path, run_ave):
 
     assert plan["intent_analysis"]["operation"]["mode"] == "enumerate"
     generated = [slot for slot in plan["expanded_slots"] if slot.get("generated_from")]
-    assert generated and all("love" in slot["generated_from"] for slot in generated)
+    assert generated and all("opening" in slot["generated_from"] for slot in generated)
     assert plan["selected_sequence"]
     assert len(plan["selected_sequence"]) == len(generated)
     # chronological order across the generated slots

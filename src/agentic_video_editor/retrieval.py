@@ -373,6 +373,8 @@ def _packet(
             "context": segment.get("corpus_meaning"),
             "word_units": segment.get("word_units") or [],
             "story_function": segment.get("story_function"),
+            "setup_questions": segment.get("setup_questions") or [],
+            "payoff_answers": segment.get("payoff_answers") or [],
             "audio_affordance": segment.get("audio_affordance"),
             "visual_affordance": segment.get("visual_affordance"),
             "needs_caption": segment.get("needs_caption"),

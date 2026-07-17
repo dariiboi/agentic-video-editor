@@ -25,7 +25,19 @@ def test_profile_reports_inventory_speech_facets_and_openers(tmp_path, run_ave):
 
     profile = _json(run_ave("profile", project_dir, "--json"))
 
-    assert set(profile) == {"assets", "speech", "segments", "facets", "openers", "enders", "clusters"}
+    assert set(profile) == {
+        "assets",
+        "speech",
+        "segments",
+        "quotable_lines",
+        "facets",
+        "openers",
+        "enders",
+        "clusters",
+    }
+    assert profile["quotable_lines"]
+    assert profile["quotable_lines"][0]["text"]
+    assert profile["quotable_lines"][0]["end_sec"] > profile["quotable_lines"][0]["start_sec"]
     assert profile["assets"]["ready_count"] == 1
     assert profile["assets"]["total_duration_sec"] > 0
     assert profile["speech"]["basis"] in {"word_alignments", "transcript_spans"}

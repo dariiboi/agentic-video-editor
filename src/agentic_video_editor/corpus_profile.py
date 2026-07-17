@@ -10,6 +10,7 @@ from .project import Project
 
 
 TOP_TERMS_PER_FACET = 8
+TOP_QUOTABLE_LINES = 8
 TOP_CANDIDATES = 5
 TOP_ASSETS_LISTED = 10
 TOP_CLUSTERS = 3
@@ -44,6 +45,16 @@ def corpus_profile(project: Project) -> dict[str, Any]:
         ).fetchall()
         segment_rows = conn.execute(
             "select start_sec, end_sec, usable from segments where project_id = ?",
+            ("default",),
+        ).fetchall()
+        quote_rows = conn.execute(
+            """
+            select assets.file_name, segments.word_units_json
+            from segments
+            join assets on assets.id = segments.asset_id
+            where segments.project_id = ? and segments.usable = 1
+            order by assets.file_name, segments.start_sec
+            """,
             ("default",),
         ).fetchall()
         observation_rows = conn.execute(
@@ -82,6 +93,7 @@ def corpus_profile(project: Project) -> dict[str, Any]:
         "assets": _asset_inventory(assets),
         "speech": _speech_density(assets, word_rows, span_rows),
         "segments": _segment_inventory(segment_rows),
+        "quotable_lines": _quotable_lines(quote_rows),
         "facets": _facet_histograms(observation_rows),
         "openers": _role_candidates(candidate_rows, OPENER_ROLES),
         "enders": _role_candidates(candidate_rows, ENDER_ROLES),
@@ -176,6 +188,42 @@ def _segment_inventory(segment_rows) -> dict[str, Any]:
         "usable_count": len(durations),
         "duration_distribution": distribution,
     }
+
+
+def _quotable_lines(quote_rows) -> list[dict[str, Any]]:
+    """Verbatim word units with timestamps — the material a word-driven
+    structure can quote back without ever inventing times."""
+    lines: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in quote_rows:
+        try:
+            units = json.loads(row["word_units_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        for unit in units if isinstance(units, list) else []:
+            if not isinstance(unit, dict):
+                continue
+            text = str(unit.get("text") or "").strip()
+            try:
+                start, end = float(unit["start_sec"]), float(unit["end_sec"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            key = text.lower()
+            if not text or key in seen or end <= start:
+                continue
+            seen.add(key)
+            lines.append(
+                {
+                    "text": text,
+                    "file_name": row["file_name"],
+                    "start_sec": start,
+                    "end_sec": end,
+                    "kind": str(unit.get("kind") or ""),
+                }
+            )
+            if len(lines) >= TOP_QUOTABLE_LINES:
+                return lines
+    return lines
 
 
 def _facet_histograms(observation_rows) -> dict[str, Any]:
@@ -338,6 +386,13 @@ def corpus_profile_markdown(profile: dict[str, Any]) -> str:
             f"- {segments['usable_count']} usable of {segments['count']} total; durations "
             f"{distribution['min_sec']}s min / {distribution['median_sec']}s median / {distribution['max_sec']}s max"
         )
+
+    quotes = profile["quotable_lines"]
+    lines += ["", "## Quotable lines (verbatim)"]
+    if not quotes:
+        lines.append("- none indexed yet")
+    for quote in quotes:
+        lines.append(f'- "{quote["text"]}" [{quote["file_name"]} {quote["start_sec"]:.2f}-{quote["end_sec"]:.2f}]')
 
     facets = profile["facets"]
     lines += ["", f"## Facet observations ({facets['observation_count']} total)"]
