@@ -14,6 +14,7 @@ from .cutpoints import cut_point_summary, detect_cut_points
 from .facets import FACETS, facet_analyze_project, facet_search, facet_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
+from .intent import analyze_intent, intent_markdown
 from .planner import create_edit_plan
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
@@ -170,6 +171,16 @@ def build_parser() -> argparse.ArgumentParser:
     profile_parser.add_argument("project_dir", type=Path)
     profile_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     profile_parser.set_defaults(func=_profile_command)
+
+    intent_parser = subcommands.add_parser("intent", help="Analyze a directive into an operation frame with provenance")
+    intent_parser.add_argument("project_dir", type=Path)
+    intent_parser.add_argument("--directive", required=True)
+    intent_parser.add_argument("--duration-sec", type=float, default=60.0)
+    intent_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"])
+    intent_parser.add_argument("--model", default=DEFAULT_MODEL)
+    intent_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
+    intent_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    intent_parser.set_defaults(func=_intent_command)
 
     context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
     context_build_parser.add_argument("project_dir", type=Path)
@@ -572,6 +583,23 @@ def _profile_command(args: argparse.Namespace) -> int:
         print(json.dumps(profile, indent=2))
     else:
         print(corpus_profile_markdown(profile))
+    return 0
+
+
+def _intent_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    analysis = analyze_intent(
+        project,
+        args.directive,
+        duration_sec=args.duration_sec,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+    )
+    if args.json:
+        print(json.dumps(analysis, indent=2))
+    else:
+        print(intent_markdown(analysis))
     return 0
 
 

@@ -98,7 +98,9 @@ class GeminiVideoSession:
 
 class MockProvider:
     def generate_text_json(self, prompt: str) -> dict[str, Any]:
-        del prompt
+        intent_payload = _mock_intent_payload(prompt)
+        if intent_payload is not None:
+            return intent_payload
         return {}
 
     @contextmanager
@@ -301,6 +303,111 @@ def _mock_facet_payload(prompt: str) -> dict[str, Any] | None:
     if facet in _MOCK_FACET_OBSERVATIONS:
         return {"observations": [dict(item) for item in _MOCK_FACET_OBSERVATIONS[facet]]}
     return None
+
+
+def _mock_intent_payload(prompt: str) -> dict[str, Any] | None:
+    """Deterministic canned IntentAgent replies keyed off the embedded directive.
+
+    Simple string dispatch so acceptance tests can steer operation modes,
+    provenance spreads, and anchors without a live model.
+    """
+    if "INTENT_AGENT" not in prompt:
+        return None
+    match = re.search(r"^DIRECTIVE: (.*)$", prompt, flags=re.M)
+    directive = (match.group(1) if match else "").strip()
+    lowered = directive.lower()
+
+    anchors = []
+    open_match = re.search(r"open (?:on|with) ([^,;.]+)", lowered)
+    if open_match:
+        anchors.append({"description": open_match.group(1).strip(), "position": "first", "provenance": "user_explicit"})
+    end_match = re.search(r"end (?:on|with) ([^,;.]+)", lowered)
+    if end_match:
+        anchors.append({"description": end_match.group(1).strip(), "position": "last", "provenance": "user_explicit"})
+
+    base: dict[str, Any] = {
+        "operation": {"sources": "corpus", "output": "timeline", "mode": "compose"},
+        "edit_type": "custom_edit",
+        "requirements": [{"text": directive or "use the footage well", "provenance": "user_explicit", "why": None}],
+        "hard_constraints": {},
+        "anchors": anchors,
+        "conflicts": [],
+        "evidence_attributes": [],
+        "success_rubric": {"directive_fit": 0.6, "watchability": 0.4},
+    }
+
+    if any(marker in lowered for marker in ("every time", "each time", "supercut")):
+        base["operation"]["mode"] = "enumerate"
+        base["edit_type"] = "supercut"
+        quoted = re.search(r"[\"']([^\"']+)[\"']", directive)
+        if quoted:
+            base["evidence_attributes"] = [f"spoken word '{quoted.group(1)}'"]
+        return base
+
+    if any(marker in lowered for marker in ("cut out", "remove the", "strip out")):
+        base["operation"]["mode"] = "subtract"
+        base["edit_type"] = "cleanup"
+        base["requirements"].append(
+            {
+                "text": "keep everything not matched by the removal description",
+                "provenance": "user_implicit",
+                "why": "a subtractive ask implies the remainder is the deliverable",
+            }
+        )
+        return base
+
+    if lowered.startswith("revise") or "make the middle" in lowered:
+        base["operation"] = {"sources": "timeline:latest", "output": "revision", "mode": "transform"}
+        base["edit_type"] = "revision"
+        return base
+
+    if "battle between" in lowered:
+        base["edit_type"] = "faction_battle"
+        base["evidence_attributes"] = ["t-shirt color", "team membership", "confrontational action"]
+        base["requirements"] = [
+            {"text": directive, "provenance": "user_explicit", "why": None},
+            {
+                "text": "escalate the exchanges between the factions toward a collision",
+                "provenance": "user_implicit",
+                "why": "a battle implies rising stakes, not a flat sequence of turns",
+            },
+            {
+                "text": "close on an aftermath rather than a declared winner",
+                "provenance": "agent",
+                "why": "no footage shows a decisive outcome; an aftermath beat is castable",
+            },
+        ]
+        base["success_rubric"] = {
+            "faction_clarity": 0.3,
+            "escalation": 0.3,
+            "casting_accuracy": 0.2,
+            "ending": 0.2,
+        }
+        return base
+
+    if len(lowered.split()) <= 6 and not anchors:
+        base["edit_type"] = "footage_first_pitch"
+        base["requirements"] = [
+            {"text": directive or "make something from the footage", "provenance": "user_explicit", "why": None},
+            {
+                "text": "pitch the strongest storyline the index supports",
+                "provenance": "agent",
+                "why": "the directive pins nothing; the corpus profile is the only ground",
+            },
+            {
+                "text": "favor high-scoring openers and enders already surfaced by the profile",
+                "provenance": "agent",
+                "why": "existing scores are the only quality evidence available",
+            },
+            {
+                "text": "keep the cut coherent around one visual thread",
+                "provenance": "agent",
+                "why": "an unpinned brief still needs a spine to avoid a shuffle feel",
+            },
+        ]
+        return base
+
+    return base
 
 
 class MockVideoSession:
