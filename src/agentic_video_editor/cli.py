@@ -10,6 +10,7 @@ from .analyze import analyze_project, summarize_local_analysis
 from .context import build_editorial_context, context_summary
 from .critique import critique_render, review_summary
 from .cutpoints import cut_point_summary, detect_cut_points
+from .facets import FACETS, facet_analyze_project, facet_summary
 from .gemini_provider import DEFAULT_MODEL
 from .ingest import ingest_paths, list_assets
 from .planner import create_edit_plan
@@ -139,6 +140,23 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_summary_parser.add_argument("project_dir", type=Path)
     semantic_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     semantic_summary_parser.set_defaults(func=_semantic_summary_command)
+
+    facets_parser = subcommands.add_parser("facets", help="Run multi-facet observation passes (one upload, many prompts)")
+    facets_parser.add_argument("project_dir", type=Path)
+    facets_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"])
+    facets_parser.add_argument("--model", default=DEFAULT_MODEL)
+    facets_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
+    facets_parser.add_argument("--limit", type=int)
+    facets_parser.add_argument("--only", action="append", choices=FACETS, help="Run only this facet (repeatable)")
+    facets_parser.add_argument("--budget", action="store_true", help="One combined prompt per asset instead of per-facet passes")
+    facets_parser.add_argument("--force", action="store_true", help="Re-run facets that already have observations")
+    facets_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    facets_parser.set_defaults(func=_facets_command)
+
+    facets_summary_parser = subcommands.add_parser("facets-summary", help="Summarize facet observations")
+    facets_summary_parser.add_argument("project_dir", type=Path)
+    facets_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    facets_summary_parser.set_defaults(func=_facets_summary_command)
 
     context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
     context_build_parser.add_argument("project_dir", type=Path)
@@ -482,6 +500,40 @@ def _semantic_summary_command(args: argparse.Namespace) -> int:
         print(f"Segments: {summary['segments']}")
         print(f"Selects: {summary['selects']}")
         print(f"Relationships: {summary['relationships']}")
+    return 0
+
+
+def _facets_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = facet_analyze_project(
+        project,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+        limit=args.limit,
+        force=args.force,
+        only=args.only,
+        budget=args.budget,
+    )
+    data = {
+        "assets_requested": summary.assets_requested,
+        "assets_completed": summary.assets_completed,
+        "facets_run": summary.facets_run,
+        "facets_skipped": summary.facets_skipped,
+        "observations_created": summary.observations_created,
+    }
+    return _print_json_or_lines(args.json, data, "Facets")
+
+
+def _facets_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = facet_summary(project)
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        print(f"Observations: {data['observations']}")
+        for facet, count in data["by_facet"].items():
+            print(f"  {facet}: {count}")
     return 0
 
 

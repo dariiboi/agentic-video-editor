@@ -411,6 +411,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "segments", "visual_affordance", "text")
     _ensure_column(conn, "segments", "needs_caption", "integer")
     _ensure_column(conn, "segments", "cut_notes", "text")
+    _ensure_column(conn, "observations", "start_sec", "real")
+    _ensure_column(conn, "observations", "end_sec", "real")
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:

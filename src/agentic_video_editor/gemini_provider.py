@@ -106,7 +106,9 @@ class MockProvider:
         yield MockVideoSession(self, video_path)
 
     def generate_video_json(self, video_path: Path, prompt: str) -> dict[str, Any]:
-        del prompt
+        facet_payload = _mock_facet_payload(prompt)
+        if facet_payload is not None:
+            return facet_payload
         name = video_path.stem
         return {
             "spans": [
@@ -152,6 +154,153 @@ class MockProvider:
                 }
             ],
         }
+
+
+# Canned facet observations keyed by the FACET: marker each facet prompt carries.
+# Shaped after the t-shirt battle acceptance corpus so downstream retrieval tests
+# can find casting attributes like "green t-shirt".
+_MOCK_FACET_OBSERVATIONS: dict[str, list[dict[str, Any]]] = {
+    "people_appearance": [
+        {
+            "start_sec": 0.0,
+            "end_sec": 6.0,
+            "person": "P1",
+            "clothing": [{"garment": "t-shirt", "color": "green"}],
+            "hair": "short dark hair",
+            "accessories": [],
+            "distinguishing_features": ["tall"],
+            "evidence": "A tall performer in a green t-shirt stands center frame.",
+            "confidence": 0.8,
+        },
+        {
+            "start_sec": 4.0,
+            "end_sec": 10.0,
+            "person": "P2",
+            "clothing": [{"garment": "t-shirt", "color": "blue"}],
+            "hair": "curly hair",
+            "accessories": ["wristband"],
+            "distinguishing_features": [],
+            "evidence": "A second person in a blue t-shirt enters from the left.",
+            "confidence": 0.7,
+        },
+    ],
+    "groups_interactions": [
+        {
+            "start_sec": 2.0,
+            "end_sec": 9.0,
+            "group_label": "green team vs blue team",
+            "members": ["P1", "P2"],
+            "interaction": "square off across the room",
+            "tone": "competitive",
+            "evidence": "P1 in green and P2 in blue face each other with arms crossed.",
+            "confidence": 0.7,
+        }
+    ],
+    "actions_events": [
+        {
+            "start_sec": 1.0,
+            "end_sec": 2.5,
+            "action": "throws ball",
+            "actors": ["P1"],
+            "objects": ["ball"],
+            "evidence": "P1 winds up and throws a ball across frame.",
+            "confidence": 0.8,
+        },
+        {
+            "start_sec": 5.0,
+            "end_sec": 6.0,
+            "action": "high-fives teammate",
+            "actors": ["P2"],
+            "objects": [],
+            "evidence": "P2 high-fives someone off-screen right.",
+            "confidence": 0.7,
+        },
+    ],
+    "setting_context": [
+        {
+            "start_sec": 0.0,
+            "end_sec": 10.0,
+            "location_type": "rehearsal room",
+            "indoor_outdoor": "indoor",
+            "era_cues": ["modern LED lighting"],
+            "weather": None,
+            "time_of_day": "unclear",
+            "evidence": "Bare-walled room with LED panels and a marked floor.",
+            "confidence": 0.8,
+        }
+    ],
+    "cinematography": [
+        {
+            "start_sec": 0.0,
+            "end_sec": 4.0,
+            "shot_size": "wide",
+            "angle": "eye level",
+            "camera_motion": "handheld follow right",
+            "composition": "subject center, negative space left",
+            "lighting": "even indoor key",
+            "evidence": "Wide handheld shot tracking the performer rightward.",
+            "confidence": 0.8,
+        },
+        {
+            "start_sec": 4.0,
+            "end_sec": 7.0,
+            "shot_size": "close_up",
+            "angle": "slightly low",
+            "camera_motion": "static",
+            "composition": "face fills right third",
+            "lighting": "even indoor key",
+            "evidence": "Static close-up on the performer's face.",
+            "confidence": 0.7,
+        },
+    ],
+    "emotion_tone": [
+        {
+            "start_sec": 3.0,
+            "end_sec": 8.0,
+            "subject": "P1",
+            "expression": "grin",
+            "body_language": "bounces on toes",
+            "mood": "excited",
+            "trajectory": "builds from focused to jubilant",
+            "evidence": "P1 breaks into a grin and bounces on their toes.",
+            "confidence": 0.7,
+        }
+    ],
+    "objects_text": [
+        {
+            "start_sec": 0.5,
+            "end_sec": 3.0,
+            "kind": "signage",
+            "name": "wall banner",
+            "text": "FIELD DAY",
+            "evidence": "A banner reading 'FIELD DAY' hangs on the back wall.",
+            "confidence": 0.8,
+        }
+    ],
+    "audio_character": [
+        {
+            "start_sec": 0.0,
+            "end_sec": 10.0,
+            "balance": "mixed",
+            "energy": "rising",
+            "notable_sounds": ["cheering", "clapping"],
+            "evidence": "Music under crowd cheers that grow louder toward the end.",
+            "confidence": 0.7,
+        }
+    ],
+}
+
+
+def _mock_facet_payload(prompt: str) -> dict[str, Any] | None:
+    match = re.search(r"^FACET: ([a-z_]+)$", prompt, flags=re.M)
+    if not match:
+        return None
+    facet = match.group(1)
+    if facet == "all_facets_budget":
+        return {"facets": {name: [dict(item) for item in items] for name, items in _MOCK_FACET_OBSERVATIONS.items()}}
+    if facet in _MOCK_FACET_OBSERVATIONS:
+        return {"observations": [dict(item) for item in _MOCK_FACET_OBSERVATIONS[facet]]}
+    return None
 
 
 class MockVideoSession:
