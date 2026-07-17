@@ -8,6 +8,7 @@ from pathlib import Path
 from .align import align_project, align_summary
 from .analyze import analyze_project, summarize_local_analysis
 from .context import build_editorial_context, context_summary
+from .corpus_profile import corpus_profile, corpus_profile_markdown
 from .critique import critique_render, review_summary
 from .cutpoints import cut_point_summary, detect_cut_points
 from .facets import FACETS, facet_analyze_project, facet_search, facet_summary
@@ -164,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     facet_search_parser.add_argument("--limit", type=int, default=10)
     facet_search_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     facet_search_parser.set_defaults(func=_facet_search_command)
+
+    profile_parser = subcommands.add_parser("profile", help="Deterministic corpus profile for agent prompts")
+    profile_parser.add_argument("project_dir", type=Path)
+    profile_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    profile_parser.set_defaults(func=_profile_command)
 
     context_build_parser = subcommands.add_parser("context-build", help="Build editorial context cards")
     context_build_parser.add_argument("project_dir", type=Path)
@@ -556,6 +562,16 @@ def _facet_search_command(args: argparse.Namespace) -> int:
                 f"{result['file_name']} {result['start_sec']:.1f}-{result['end_sec']:.1f} "
                 f"[{result['observation_type']}]: {evidence or result['value']}"
             )
+    return 0
+
+
+def _profile_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    profile = corpus_profile(project)
+    if args.json:
+        print(json.dumps(profile, indent=2))
+    else:
+        print(corpus_profile_markdown(profile))
     return 0
 
 
