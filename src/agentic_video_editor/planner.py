@@ -288,6 +288,7 @@ def create_edit_plan(
         warnings=casting_warnings,
     )
     items = _decisions_to_items(casting["decisions"], structure, duration_sec, casting_warnings)
+    _attach_overlays(items, casting.get("overlay_decisions") or [], casting_warnings)
     _assign_timing(items, duration_sec, reserve_ending=bool(structure["ending_policy"].get("reserve_ending", True)))
     plan = {
         "plan_id": f"plan_{uuid.uuid4().hex[:16]}",
@@ -362,6 +363,43 @@ def _decisions_to_items(
         items.append(item)
     _link_recontextualizations(items, decisions, warnings)
     return items
+
+
+def _attach_overlays(
+    items: list[dict[str, Any]],
+    overlay_decisions: list[dict[str, Any]],
+    warnings: list[str],
+) -> None:
+    """Attach each cast cutaway to its slot's first shot item.
+
+    The overlay carries its own video source range; its audio is the primary
+    item's, so the audio-side word-unit guard is the primary's own guard. The
+    timeline compiler validates that the b-roll can cover the item and drops
+    the overlay (with a why) when it cannot.
+    """
+    first_item_by_slot: dict[str, dict[str, Any]] = {}
+    for item in items:
+        first_item_by_slot.setdefault(item["slot_id"], item)
+    for decision in overlay_decisions:
+        item = first_item_by_slot.get(decision["overlay_of"])
+        if item is None:
+            warnings.append(f"overlay for {decision['overlay_of']} had no cast primary item; dropped")
+            continue
+        packet = decision["packet"]
+        trim_start, trim_end = (float(value) for value in packet["trim_range"])
+        item["overlay"] = {
+            "segment_id": packet["segment_id"],
+            "asset_id": packet["asset_id"],
+            "file_name": packet["file_name"],
+            "asset_duration_sec": packet.get("asset_duration_sec"),
+            "source_start_sec": round(trim_start, 3),
+            "source_end_sec": round(trim_end, 3),
+            "need": decision["need"],
+            "audio": decision["audio"],
+            "why": decision["why"],
+            "risks": decision["risks"],
+            "matched_via": decision["matched_via"],
+        }
 
 
 def _expand_generator_slots(

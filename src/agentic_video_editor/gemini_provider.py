@@ -690,7 +690,12 @@ def _mock_structure_payload(prompt: str) -> dict[str, Any] | None:
             "beats": [
                 {"id": "m1", "function": "arrive_in_the_place", "intensity_target": 0.35, "visual_need": "establishing setting"},
                 {"id": "m2", "function": "meet_the_person", "intensity_target": 0.4},
-                {"id": "m3", "function": "the_work_itself", "intensity_target": 0.55},
+                {
+                    "id": "m3",
+                    "function": "the_work_itself",
+                    "intensity_target": 0.55,
+                    "overlay": {"need": "hands at work, the craft in close detail", "audio": "keep_primary"},
+                },
                 {"id": "m4", "function": "what_it_costs", "intensity_target": 0.45},
                 {"id": "m5", "function": "where_it_lands", "intensity_target": 0.25},
             ],

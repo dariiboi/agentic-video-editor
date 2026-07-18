@@ -68,6 +68,7 @@ def create_timeline(
                 candidates = _fallback_items(conn)
 
         cut_points_by_asset: dict[str, list[dict[str, Any]]] = {}
+        overlay_items: list[dict[str, Any]] = []
         for candidate in candidates:
             if timeline_cursor >= duration_sec:
                 break
@@ -83,10 +84,26 @@ def create_timeline(
                 snap_tolerance_sec=snap_tolerance_sec,
             )
             items.append(item)
+            if candidate.get("overlay"):
+                overlay_item = _overlay_item(
+                    candidate["overlay"],
+                    item,
+                    cut_points=_asset_cut_points(conn, candidate["overlay"]["asset_id"], cut_points_by_asset),
+                    snap_tolerance_sec=snap_tolerance_sec,
+                )
+                if overlay_item:
+                    overlay_items.append(overlay_item)
+                else:
+                    item.setdefault("warnings", []).append(
+                        f"overlay dropped: b-roll {candidate['overlay']['segment_id']} cannot cover the clip"
+                    )
             timeline_cursor += clip_duration
 
         _assign_transitions(items)
         _assign_captions(items)
+        tracks = [{"kind": "video", "name": "A-roll", "items": items}]
+        if overlay_items:
+            tracks.append({"kind": "broll", "name": "overlay", "items": overlay_items})
         timeline_json = {
             "timeline_id": timeline_id,
             "directive_id": directive_id,
@@ -94,7 +111,7 @@ def create_timeline(
             "duration_target_sec": duration_sec,
             "context_aware": context_aware,
             "edit_plan": edit_plan,
-            "tracks": [{"kind": "video", "name": "A-roll", "items": items}],
+            "tracks": tracks,
         }
 
         conn.execute(
@@ -116,7 +133,7 @@ def create_timeline(
                 now,
             ),
         )
-        for item in items:
+        for item in items + overlay_items:
             conn.execute(
                 """
                 insert into timeline_items (
@@ -124,16 +141,16 @@ def create_timeline(
                     segment_id, source_start_sec, source_end_sec, timeline_start_sec,
                     timeline_end_sec, role, reason, why_here, before_context,
                     after_context, caption_text, transition_note, continuity_score,
-                    transition_json, caption_decision_json, created_at
+                    transition_json, caption_decision_json, overlay_json, created_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item["id"],
                     "default",
                     timeline_id,
-                    "video",
-                    "A-roll",
+                    item.get("track_kind") or "video",
+                    item.get("track_name") or "A-roll",
                     item["asset_id"],
                     item["segment_id"],
                     item["source_start_sec"],
@@ -150,6 +167,7 @@ def create_timeline(
                     item.get("continuity_score"),
                     json.dumps(item.get("transition")) if item.get("transition") else None,
                     json.dumps(item.get("caption_decision")) if item.get("caption_decision") else None,
+                    json.dumps(item.get("overlay_meta")) if item.get("overlay_meta") else None,
                     now,
                 ),
             )
@@ -157,7 +175,7 @@ def create_timeline(
     return TimelineSummary(
         timeline_id=timeline_id,
         directive_id=directive_id,
-        items_created=len(items),
+        items_created=len(items) + len(overlay_items),
         duration_sec=round(timeline_cursor, 3),
     )
 
@@ -268,6 +286,7 @@ def _planned_items(conn, sequence: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "needs_caption": item.get("source_evidence", {}).get("needs_caption"),
                 "max_duration_sec": item.get("max_duration_sec"),
                 "trim_anchor": item.get("trim_anchor"),
+                "overlay": item.get("overlay"),
             }
         )
     return candidates
@@ -339,6 +358,59 @@ def _timeline_item_from_candidate(
     }
     item.update(_rational_time_fields(item, float(candidate["fps"] or 30.0)))
     return item, clip_duration
+
+
+def _overlay_item(
+    overlay: dict[str, Any],
+    primary: dict[str, Any],
+    *,
+    cut_points: list[dict[str, Any]],
+    snap_tolerance_sec: float,
+) -> dict[str, Any] | None:
+    """Compile a cast cutaway into a broll-track item over its primary clip.
+
+    Video comes from the b-roll range; audio stays the primary's (already
+    word-unit guarded upstream), so the overlay must cover the primary's full
+    duration — a b-roll span too short to do that is dropped, not stretched.
+    """
+    duration = float(primary["timeline_end_sec"]) - float(primary["timeline_start_sec"])
+    avail_start = float(overlay["source_start_sec"])
+    avail_end = float(overlay["source_end_sec"])
+    asset_duration = overlay.get("asset_duration_sec")
+    if asset_duration is not None:
+        avail_end = min(avail_end, float(asset_duration) - 0.05)
+    if avail_end - avail_start + 0.01 < duration:
+        return None
+
+    video_start = avail_start
+    if cut_points and snap_tolerance_sec > 0:
+        snap = snap_range(cut_points, video_start, video_start + duration, tolerance_sec=snap_tolerance_sec)
+        if snap["start_snapped_to"]:
+            video_start = snap["start_sec"]
+    video_start = max(avail_start, min(video_start, avail_end - duration))
+
+    return {
+        "id": f"item_{uuid.uuid4().hex[:16]}",
+        "track_kind": "broll",
+        "track_name": "overlay",
+        "asset_id": overlay["asset_id"],
+        "segment_id": overlay["segment_id"],
+        "source_start_sec": round(video_start, 3),
+        "source_end_sec": round(video_start + duration, 3),
+        "timeline_start_sec": primary["timeline_start_sec"],
+        "timeline_end_sec": primary["timeline_end_sec"],
+        "role": "cutaway",
+        "reason": overlay.get("why"),
+        "why_here": f"cutaway ({overlay.get('need')}): {overlay.get('why')}",
+        "overlay_meta": {
+            "overlay_of": primary["id"],
+            "audio": overlay.get("audio") or "keep_primary",
+            "audio_asset_id": primary["asset_id"],
+            "audio_source_start_sec": primary["source_start_sec"],
+            "audio_source_end_sec": primary["source_end_sec"],
+            "need": overlay.get("need"),
+        },
+    }
 
 
 def _assign_transitions(items: list[dict[str, Any]]) -> None:

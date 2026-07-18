@@ -168,7 +168,33 @@ def _load_timeline_items(project: Project, timeline_id: str):
 
     if not items:
         raise ValueError("Timeline has no items")
-    return timeline, [dict(row) for row in items]
+    return timeline, _pair_overlays([dict(row) for row in items])
+
+
+def _pair_overlays(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold broll-track rows onto their primary items as render overlays.
+
+    A broll row that names a missing primary is skipped (rendering the audio
+    of nothing is not an option); primaries without overlays are untouched.
+    """
+    primaries = [row for row in rows if row.get("track_kind") != "broll"]
+    by_id = {row["id"]: row for row in primaries}
+    for row in rows:
+        if row.get("track_kind") != "broll":
+            continue
+        try:
+            meta = json.loads(row.get("overlay_json") or "{}")
+        except (TypeError, json.JSONDecodeError):
+            meta = {}
+        primary = by_id.get(meta.get("overlay_of"))
+        if primary is None:
+            continue
+        primary["overlay_render"] = {
+            "video_path": row["asset_path"],
+            "video_start_sec": float(row["source_start_sec"]),
+            "video_end_sec": float(row["source_end_sec"]),
+        }
+    return primaries
 
 
 def _clamped_range(item: dict[str, Any]) -> tuple[float, float]:
@@ -212,21 +238,7 @@ def _clip_command(
     if micro_fade_out:
         audio_filters.append(f"afade=t=out:st={max(0.0, duration - fade):.3f}:d={fade:.3f}")
 
-    return [
-        "ffmpeg",
-        "-y",
-        "-v",
-        "error",
-        "-ss",
-        f"{start:.3f}",
-        "-t",
-        f"{duration:.3f}",
-        "-i",
-        str(item["asset_path"]),
-        "-vf",
-        ",".join(video_filters),
-        "-af",
-        ",".join(audio_filters),
+    codec_args = [
         "-c:v",
         "libx264",
         "-preset",
@@ -244,6 +256,56 @@ def _clip_command(
         "-movflags",
         "+faststart",
         str(clip_path),
+    ]
+
+    overlay = item.get("overlay_render")
+    if overlay:
+        # J/L-style cutaway: video from the b-roll input, audio from the
+        # primary's continuing range; the mux happens per segment so the
+        # concat/transition/loudness pipeline downstream stays unchanged.
+        video_start = float(overlay["video_start_sec"])
+        return [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-ss",
+            f"{video_start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(overlay["video_path"]),
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            str(item["asset_path"]),
+            "-filter_complex",
+            f"[0:v]{','.join(video_filters)}[v];[1:a]{','.join(audio_filters)}[a]",
+            "-map",
+            "[v]",
+            "-map",
+            "[a]",
+            *codec_args,
+        ]
+
+    return [
+        "ffmpeg",
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        f"{start:.3f}",
+        "-t",
+        f"{duration:.3f}",
+        "-i",
+        str(item["asset_path"]),
+        "-vf",
+        ",".join(video_filters),
+        "-af",
+        ",".join(audio_filters),
+        *codec_args,
     ]
 
 

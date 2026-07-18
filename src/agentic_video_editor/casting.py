@@ -461,6 +461,7 @@ def cast_structure(
     _pin_anchor_slots(slots, anchors_resolved, warnings)
 
     decisions: list[dict[str, Any]] = []
+    overlay_decisions: list[dict[str, Any]] = []
     sanctioned_reuse: list[dict[str, Any]] = []
     motif_registry: dict[str, dict[str, Any]] = {}
     used_segments: set[str] = set()
@@ -528,10 +529,77 @@ def cast_structure(
                 break
         slot.pop("preselected_packet", None)
 
+        if slot.get("overlay") and shot_packets:
+            overlay_decision = _cast_overlay(
+                project, provider, slot, shot_packets[0], intent, lane_filters, warnings
+            )
+            if overlay_decision:
+                overlay_decisions.append(overlay_decision)
+                used_segments.add(overlay_decision["packet"]["segment_id"])
+                used_assets.add(overlay_decision["packet"]["asset_id"])
+                # previous_packet stays the primary: the overlay does not change
+                # the join context — its audio is the primary's, continuing.
+
     return {
         "decisions": decisions,
+        "overlay_decisions": overlay_decisions,
         "coverage_report": coverage_report(project, intent),
         "sanctioned_reuse": sanctioned_reuse,
+    }
+
+
+def _cast_overlay(
+    project: Project,
+    provider,
+    slot: dict[str, Any],
+    primary_packet: dict[str, Any],
+    intent: dict[str, Any],
+    lane_filters: dict[str, str],
+    warnings: list[str],
+) -> dict[str, Any] | None:
+    """Cast one cutaway for a slot that declared an overlay.
+
+    The overlay's own need text governs its casting (no lane filter — a lane
+    requirement belongs in the need text); the slot's withhold filters still
+    apply so staged reveals cannot leak in through b-roll. Candidates are
+    preferred voiceless-first (their audio is discarded), then by visual
+    evidence; the primary's segment is never its own cutaway.
+    """
+    overlay = slot["overlay"]
+    overlay_slot = {
+        **slot,
+        "slot_id": f"{slot['slot_id']}/overlay",
+        "function": f"{slot['function']}_cutaway",
+        "lane": None,
+        "visual_need": overlay["need"],
+        "word_need": "",
+        "casting_filter": "",
+        "motif": None,
+        "fill": None,
+        "generator": None,
+    }
+    pool = [
+        packet
+        for packet in gather_candidates(project, overlay_slot, intent, lane_filters)
+        if packet["segment_id"] != primary_packet["segment_id"]
+    ]
+    voiceless = [packet for packet in pool if "abrupt_audio_or_no_audio" in (packet.get("warnings") or [])]
+    visual = [packet for packet in pool if packet.get("source_evidence", {}).get("visual_affordance")]
+    pool = voiceless or visual or pool
+    if not pool:
+        warnings.append(f"slot {slot['slot_id']} overlay dropped: no cutaway candidates for {overlay['need']!r}")
+        return None
+    decision = cast_slot(provider, overlay_slot, pool, primary_packet)
+    warnings.extend(decision["warnings"])
+    return {
+        "slot": slot,
+        "packet": decision["packet"],
+        "overlay_of": slot["slot_id"],
+        "need": overlay["need"],
+        "audio": overlay["audio"],
+        "why": decision["why"],
+        "risks": decision["risks"],
+        "matched_via": decision["packet"].get("matched_via", []),
     }
 
 

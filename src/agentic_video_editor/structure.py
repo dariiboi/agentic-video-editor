@@ -62,6 +62,7 @@ Return JSON only:
       "motif": {{"slot": string, "occurrence": integer, "transform": string}},
       "withhold": [string],
       "recontextualizes": string_or_null,
+      "overlay": {{"need": string, "audio": "keep_primary"}},
       "visual_need": string,
       "word_need": string,
       "casting_filter": string
@@ -91,6 +92,11 @@ Rules:
   "recontextualizes" marks a beat cast to change the meaning of an earlier one.
 - enumerate beats generate one slot per match of from_query (this is how
   supercuts and inventories fall out of the same schema).
+- "overlay" requests a cutaway for the beat: b-roll video plays over the
+  beat's continuing primary audio (documentary J/L grammar — narration over
+  picture). "need" says what the cutaway should show; audio is always
+  "keep_primary". Put any lane/attribute requirement for the cutaway into the
+  need text itself.
 - For word-driven directives, word_spine quotes the carrying lines VERBATIM
   from the Quotable lines section with their exact timestamps; never invent or
   round a timestamp. Omit word_spine when the directive is not word-driven.
@@ -282,6 +288,7 @@ def _norm_beat(raw: Any, index: int, lane_ids: set[str], warnings: list[str]) ->
         "motif": _norm_motif(raw.get("motif"), beat_id, warnings),
         "withhold": _string_list(raw.get("withhold")),
         "recontextualizes": str(raw.get("recontextualizes")).strip() if raw.get("recontextualizes") else None,
+        "overlay": _norm_overlay(raw.get("overlay"), beat_id, warnings),
         "visual_need": str(raw.get("visual_need") or "").strip(),
         "word_need": str(raw.get("word_need") or "").strip(),
         "casting_filter": str(raw.get("casting_filter") or "").strip(),
@@ -332,6 +339,24 @@ def _norm_motif(raw: Any, beat_id: str, warnings: list[str]) -> dict[str, Any] |
         "occurrence": _int_or_none(raw.get("occurrence")) or 1,
         "transform": str(raw.get("transform") or "").strip() or None,
     }
+
+
+def _norm_overlay(raw: Any, beat_id: str, warnings: list[str]) -> dict[str, Any] | None:
+    """Cutaway request: b-roll video over the beat's continuing primary audio.
+
+    keep_primary is the only audio policy the renderer executes today; an
+    unknown policy is kept as a warning rather than silently invented.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not str(raw.get("need") or "").strip():
+        warnings.append(f"beat {beat_id} had an overlay without a need; dropped")
+        return None
+    audio = str(raw.get("audio") or "keep_primary").strip().lower()
+    if audio != "keep_primary":
+        warnings.append(f"beat {beat_id} overlay audio policy {audio!r} unsupported; using keep_primary")
+        audio = "keep_primary"
+    return {"need": str(raw["need"]).strip(), "audio": audio}
 
 
 def _norm_word_spine(raw: Any, warnings: list[str]) -> list[dict[str, Any]]:
@@ -499,6 +524,7 @@ def _slot(beat: dict[str, Any], *, occurrence: int, total: int, lane: str | None
         "motif": beat.get("motif"),
         "withhold": list(beat.get("withhold") or []),
         "recontextualizes": beat.get("recontextualizes"),
+        "overlay": beat.get("overlay"),
         "visual_need": beat.get("visual_need") or "",
         "word_need": beat.get("word_need") or "",
         "casting_filter": beat.get("casting_filter") or "",
@@ -600,6 +626,8 @@ def structure_markdown(structure: dict[str, Any]) -> str:
             parts.append(f"motif={beat['motif']['slot']}x{beat['motif']['occurrence']}")
         if beat.get("fill"):
             parts.append(f"shots={beat['fill']['shots_min']}-{beat['fill']['shots_max']}")
+        if beat.get("overlay"):
+            parts.append(f"overlay=\"{beat['overlay']['need']}\"")
         lines.append(f"- {beat['id']}: {', '.join(parts)}")
     if structure.get("ordering_constraints"):
         lines.append("")
