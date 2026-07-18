@@ -14,6 +14,18 @@ from .project import Project, utc_now
 
 AUDIO_MICRO_FADE_SEC = 0.05
 
+# A crossfade that clamps below this floor becomes a hard cut instead.
+CROSSFADE_FLOOR_SEC = 0.08
+# Un-faded content every clip must keep between its two join fades.
+MIN_SOLO_SEC = 0.1
+# Chained xfade+acrossfade graphs deadlock ffmpeg's scheduler when many short
+# clips are almost entirely consumed by fades (measured: 0.5s clips fail from
+# 4 chained joins even at 0.1s fades, while <=3 joins survive fades that leave
+# 0.02s solo, and clips >=1.5s survive deep chains). Outside that proven-safe
+# envelope the audio side is built flat (afade+adelay+amix) instead of chained.
+LEGACY_CHAIN_MAX_JOINS = 3
+LEGACY_CHAIN_MIN_CLIP_SEC = 1.5
+
 
 @dataclass(frozen=True)
 class RenderSummary:
@@ -41,14 +53,19 @@ def render_timeline(
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     commands: list[list[str]] = []
+    join_decisions: list[dict[str, Any]] = []
     status = "complete"
     try:
-        joins = _planned_joins(items, override_crossfade_sec=crossfade_sec)
+        ranges = [_clamped_range(item) for item in items]
+        clip_durations = [end - start for start, end in ranges]
+        joins, join_decisions = _resolve_joins(
+            _planned_joins(items, override_crossfade_sec=crossfade_sec),
+            clip_durations,
+        )
         clip_paths: list[Path] = []
-        clip_durations: list[float] = []
         for index, item in enumerate(items):
             clip_path = temp_dir / f"clip_{index:04d}.mp4"
-            start, end = _clamped_range(item)
+            start, end = ranges[index]
             # Micro fades only guard hard-cut sides; crossfaded sides get
             # their fade from acrossfade itself.
             fade_in = index == 0 or joins[index - 1]["type"] != "crossfade"
@@ -81,11 +98,13 @@ def render_timeline(
                 _run(command)
             commands.append(command)
             clip_paths.append(clip_path)
-            clip_durations.append(end - start)
 
         combined_path = temp_dir / "combined.mp4"
         if len(clip_paths) > 1 and any(join["type"] == "crossfade" for join in joins):
-            command = _joined_command(clip_paths, clip_durations, joins, combined_path)
+            if _legacy_chain_safe(clip_durations, joins):
+                command = _joined_command(clip_paths, clip_durations, joins, combined_path)
+            else:
+                command = _flat_joined_command(clip_paths, clip_durations, joins, combined_path)
         else:
             command = _concat_command(clip_paths, temp_dir, combined_path)
         _run(command)
@@ -108,6 +127,7 @@ def render_timeline(
             output_path=output_path,
             status=status,
             commands=commands,
+            join_decisions=join_decisions,
             duration_sec=_probe_duration(output_path) if output_path.exists() else None,
         )
         shutil.rmtree(temp_dir, ignore_errors=True)
@@ -395,6 +415,176 @@ def _planned_joins(
     return joins
 
 
+def _resolve_joins(
+    joins: list[dict[str, Any]],
+    clip_durations: list[float],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Clamp each crossfade to what its neighbor clips can actually afford.
+
+    A fade consumes its duration from the tail of the left clip and the head
+    of the right clip; two fades on one short clip can eat it entirely. Every
+    clip keeps at least MIN_SOLO_SEC un-faded, fades that clamp below
+    CROSSFADE_FLOOR_SEC become hard cuts, and every downgrade is recorded so
+    the render report says what changed and why. Timeline length is preserved:
+    shortening a fade shrinks overlap, never clip content.
+    """
+    resolved = [dict(join) for join in joins]
+    decisions: list[dict[str, Any]] = []
+    consumed_in = [0.0] * len(clip_durations)
+    elapsed = clip_durations[0]
+    for index, join in enumerate(resolved):
+        left = clip_durations[index]
+        right = clip_durations[index + 1]
+        if join["type"] != "crossfade":
+            elapsed += right
+            continue
+        requested = float(join.get("duration_sec") or 0.35)
+        affordable = min(
+            requested,
+            right / 2 - 0.01,
+            elapsed / 2 - 0.01,
+            left - consumed_in[index] - MIN_SOLO_SEC,
+        )
+        if affordable < CROSSFADE_FLOOR_SEC:
+            resolved[index] = {"type": "cut"}
+            decisions.append(
+                {
+                    "join_index": index,
+                    "requested_sec": round(requested, 3),
+                    "applied_sec": 0.0,
+                    "action": "downgraded_to_cut",
+                    "why": (
+                        f"clips of {left:.2f}s/{right:.2f}s cannot afford a "
+                        f"{requested:.2f}s crossfade; hard cut with micro fades instead"
+                    ),
+                }
+            )
+            elapsed += right
+            continue
+        if affordable < requested - 0.005:
+            decisions.append(
+                {
+                    "join_index": index,
+                    "requested_sec": round(requested, 3),
+                    "applied_sec": round(affordable, 3),
+                    "action": "shortened",
+                    "why": (
+                        f"fade shortened so the {left:.2f}s/{right:.2f}s clips keep "
+                        f"at least {MIN_SOLO_SEC:.2f}s of un-faded content"
+                    ),
+                }
+            )
+        resolved[index]["duration_sec"] = round(affordable, 3)
+        consumed_in[index + 1] = affordable
+        elapsed = elapsed - affordable + right
+    return resolved, decisions
+
+
+def _legacy_chain_safe(clip_durations: list[float], joins: list[dict[str, Any]]) -> bool:
+    """Whether the chained xfade+acrossfade graph is in its proven-safe envelope.
+
+    Measured behavior (see module constants): short chains never deadlock, and
+    deep chains only deadlock when crossfade participants are short clips.
+    """
+    crossfade_indices = [index for index, join in enumerate(joins) if join["type"] == "crossfade"]
+    if len(crossfade_indices) <= LEGACY_CHAIN_MAX_JOINS:
+        return True
+    participants = set()
+    for index in crossfade_indices:
+        participants.add(index)
+        participants.add(index + 1)
+    return min(clip_durations[index] for index in participants) >= LEGACY_CHAIN_MIN_CLIP_SEC
+
+
+def _flat_joined_command(
+    clip_paths: list[Path],
+    clip_durations: list[float],
+    joins: list[dict[str, Any]],
+    output_path: Path,
+) -> list[str]:
+    """Join clips with the audio graph built flat instead of chained.
+
+    The video side is the same xfade/concat chain as _joined_command (video
+    chains do not deadlock at depth). The audio side gives every clip its own
+    afade in/out at crossfaded joins, delays it to its timeline position, and
+    sums everything with one amix — no cross-input chaining, so the ffmpeg
+    scheduler starvation that kills deep acrossfade chains over short clips
+    cannot occur. Linear afades summed over the overlap match acrossfade's
+    default triangular curve.
+    """
+    filters: list[str] = [f"[{index}:v]settb=AVTB[vin{index}]" for index in range(len(clip_paths))]
+    video_in = "[vin0]"
+    starts = [0.0]
+    elapsed = clip_durations[0]
+    for index in range(1, len(clip_paths)):
+        join = joins[index - 1]
+        fade = float(join.get("duration_sec") or 0.0) if join["type"] == "crossfade" else 0.0
+        video_out = f"[v{index}]" if index < len(clip_paths) - 1 else "[vout]"
+        if fade >= 0.03:
+            offset = elapsed - fade
+            filters.append(
+                f"{video_in}[vin{index}]xfade=transition=fade:duration={fade:.3f}:offset={offset:.3f}{video_out}"
+            )
+            starts.append(offset)
+            elapsed = offset + clip_durations[index]
+        else:
+            filters.append(f"{video_in}[vin{index}]concat=n=2:v=1:a=0{video_out}")
+            starts.append(elapsed)
+            elapsed += clip_durations[index]
+        video_in = video_out
+
+    audio_labels = []
+    for index in range(len(clip_paths)):
+        audio_filters = []
+        fade_in = 0.0
+        if index > 0 and joins[index - 1]["type"] == "crossfade":
+            fade_in = float(joins[index - 1].get("duration_sec") or 0.0)
+        fade_out = 0.0
+        if index < len(clip_paths) - 1 and joins[index]["type"] == "crossfade":
+            fade_out = float(joins[index].get("duration_sec") or 0.0)
+        if fade_in >= 0.03:
+            audio_filters.append(f"afade=t=in:st=0:d={fade_in:.3f}")
+        if fade_out >= 0.03:
+            start_at = max(0.0, clip_durations[index] - fade_out)
+            audio_filters.append(f"afade=t=out:st={start_at:.3f}:d={fade_out:.3f}")
+        delay_ms = int(round(starts[index] * 1000))
+        if delay_ms > 0:
+            audio_filters.append(f"adelay={delay_ms}:all=1")
+        if not audio_filters:
+            audio_filters.append("anull")
+        filters.append(f"[{index}:a]{','.join(audio_filters)}[fa{index}]")
+        audio_labels.append(f"[fa{index}]")
+    filters.append(f"{''.join(audio_labels)}amix=inputs={len(clip_paths)}:normalize=0[aout]")
+
+    command = ["ffmpeg", "-y", "-v", "error"]
+    for path in clip_paths:
+        command.extend(["-i", str(path)])
+    command.extend(
+        [
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[vout]",
+            "-map",
+            "[aout]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "24",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+    return command
+
+
 def _joined_command(
     clip_paths: list[Path],
     clip_durations: list[float],
@@ -532,6 +722,7 @@ def _store_render(
     output_path: Path,
     status: str,
     commands: list[list[str]],
+    join_decisions: list[dict[str, Any]],
     duration_sec: float | None,
 ) -> None:
     with connect_db(project.db_path) as conn:
@@ -540,9 +731,9 @@ def _store_render(
             """
             insert into renders (
                 id, project_id, timeline_id, path, status, command_json,
-                duration_sec, created_at
+                report_json, duration_sec, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 render_id,
@@ -551,6 +742,7 @@ def _store_render(
                 str(output_path),
                 status,
                 json.dumps(commands),
+                json.dumps({"join_decisions": join_decisions}),
                 duration_sec,
                 utc_now(),
             ),

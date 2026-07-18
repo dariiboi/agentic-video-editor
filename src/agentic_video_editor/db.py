@@ -410,6 +410,7 @@ def migrate(conn: sqlite3.Connection) -> None:
         (SCHEMA_VERSION,),
     )
     _ensure_column(conn, "projects", "schema_version", "integer not null default 1")
+    _ensure_column(conn, "renders", "report_json", "text")
     _ensure_column(conn, "timeline_items", "why_here", "text")
     _ensure_column(conn, "timeline_items", "before_context", "text")
     _ensure_column(conn, "timeline_items", "after_context", "text")
