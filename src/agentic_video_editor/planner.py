@@ -230,11 +230,20 @@ def create_edit_plan(
         if store:
             _store_structured_plan(project, intent, plan, source)
         return plan
-    casting_warnings: list[str] = []
     if mode == "transform":
-        casting_warnings.append(
-            "transform mode is not implemented yet (revision lineage lands in a later phase); planning as compose"
+        from .revise import plan_revision
+
+        return plan_revision(
+            project,
+            intent,
+            directive=directive,
+            provider_name=provider_name,
+            model=model,
+            env_path=env_path,
+            store=store,
+            source=source,
         )
+    casting_warnings: list[str] = []
     structure = author_structure(
         project,
         intent,
@@ -495,9 +504,10 @@ def _store_structured_plan(project: Project, intent: dict[str, Any], plan: dict[
         conn.execute(
             """
             insert into edit_plans (
-                id, project_id, directive_id, intent_analysis_id, plan_json, source, created_at
+                id, project_id, directive_id, intent_analysis_id, plan_json, source,
+                parent_plan_id, created_at
             )
-            values (?, ?, ?, ?, ?, ?, ?)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 plan["plan_id"],
@@ -506,6 +516,7 @@ def _store_structured_plan(project: Project, intent: dict[str, Any], plan: dict[
                 intent.get("intent_id"),
                 json.dumps(plan, indent=2),
                 source,
+                plan.get("parent_plan_id"),
                 utc_now(),
             ),
         )

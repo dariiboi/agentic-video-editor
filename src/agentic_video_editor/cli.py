@@ -17,6 +17,7 @@ from .ingest import ingest_paths, list_assets
 from .intent import analyze_intent, intent_markdown
 from .casting import AnchorResolutionError
 from .planner import create_edit_plan
+from .revise import RevisionSourceError, plan_revision
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
 from .render import render_summary, render_timeline
@@ -246,6 +247,19 @@ def build_parser() -> argparse.ArgumentParser:
     edit_plan_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     edit_plan_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     edit_plan_parser.set_defaults(func=_edit_plan_command)
+
+    revise_parser = subcommands.add_parser(
+        "revise", help="Revise an existing edit plan with a targeted, minimal-diff edit script"
+    )
+    revise_parser.add_argument("project_dir", type=Path)
+    revise_parser.add_argument("--directive", required=True)
+    revise_parser.add_argument("--plan-id", help="Parent plan to revise (default: latest completed plan)")
+    revise_parser.add_argument("--duration-sec", type=float, default=60.0)
+    revise_parser.add_argument("--provider", default="gemini", choices=["gemini", "mock"])
+    revise_parser.add_argument("--model", default=DEFAULT_MODEL)
+    revise_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
+    revise_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    revise_parser.set_defaults(func=_revise_command)
 
     timeline_parser = subcommands.add_parser("timeline", help="Create a simple rough-cut timeline")
     timeline_parser.add_argument("project_dir", type=Path)
@@ -742,12 +756,65 @@ def _edit_plan_command(args: argparse.Namespace) -> int:
         else:
             print(f"Edit plan failed: {exc}")
         return 1
+    except RevisionSourceError as exc:
+        if args.json:
+            print(json.dumps(exc.payload, indent=2))
+        else:
+            print(f"Edit plan failed: {exc}")
+        return 1
     if args.json:
         print(json.dumps(data, indent=2))
     else:
         print(f"Edit plan: {data['plan_id']}")
         for item in data["selected_sequence"]:
             print(f"  {item['timeline_start_sec']:.1f}-{item['timeline_end_sec']:.1f} {item['beat_role']}: {item['why_here']}")
+    return 0
+
+
+def _revise_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    intent = analyze_intent(
+        project,
+        args.directive,
+        duration_sec=args.duration_sec,
+        provider_name=args.provider,
+        model=args.model,
+        env_path=args.env_path,
+    )
+    if intent["operation"]["mode"] != "transform":
+        # `ave revise` IS the revision ask; the operation frame follows the verb.
+        intent["operation"] = {
+            "sources": f"timeline:{args.plan_id}" if args.plan_id else "timeline:latest",
+            "output": "revision",
+            "mode": "transform",
+        }
+        intent.setdefault("validation_warnings", []).append(
+            "operation forced to transform: the revise command is an explicit revision ask"
+        )
+    try:
+        data = plan_revision(
+            project,
+            intent,
+            directive=args.directive,
+            plan_id=args.plan_id,
+            provider_name=args.provider,
+            model=args.model,
+            env_path=args.env_path,
+        )
+    except RevisionSourceError as exc:
+        if args.json:
+            print(json.dumps(exc.payload, indent=2))
+        else:
+            print(f"Revision failed: {exc}")
+        return 1
+    if args.json:
+        print(json.dumps(data, indent=2))
+    else:
+        diff = data["revision_diff"]
+        print(f"Revision: {data['plan_id']} (parent {data['parent_plan_id']}, status {data['status']})")
+        print(f"  {diff['items_changed']} changed / {diff['items_kept']} kept of {diff['items_revised']} items")
+        for change in diff["changes"]:
+            print(f"  - {change['description']}")
     return 0
 
 

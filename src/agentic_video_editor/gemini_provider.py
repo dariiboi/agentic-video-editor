@@ -107,6 +107,9 @@ class MockProvider:
         casting_payload = _mock_casting_payload(prompt)
         if casting_payload is not None:
             return casting_payload
+        revise_payload = _mock_revise_payload(prompt)
+        if revise_payload is not None:
+            return revise_payload
         return {}
 
     @contextmanager
@@ -861,6 +864,62 @@ def _mock_casting_payload(prompt: str) -> dict[str, Any] | None:
         "why": f"top-ranked candidate satisfying the filters for {function}",
         "risks": [],
     }
+
+
+_ORDINALS = {
+    "first": 0, "1st": 0, "second": 1, "2nd": 1, "third": 2, "3rd": 2,
+    "fourth": 3, "4th": 3, "fifth": 4, "5th": 4, "last": -1,
+}
+
+
+def _mock_revise_payload(prompt: str) -> dict[str, Any] | None:
+    """Deterministic canned RevisionAgent edit scripts keyed off the directive.
+
+    Unrecognized revision language returns an empty script — driving the
+    honest revision_not_understood path rather than an invented remake.
+    """
+    if "REVISE_AGENT" not in prompt:
+        return None
+    match = re.search(r"^DIRECTIVE: (.*)$", prompt, flags=re.M)
+    lowered = (match.group(1) if match else "").strip().lower()
+
+    if "make the middle" in lowered and ("faster" in lowered or "tighter" in lowered):
+        return {
+            "operations": [
+                {"op": "retime", "target": "middle", "factor": 0.7, "why": "user asked for a faster middle"}
+            ]
+        }
+    if "make the middle" in lowered and ("slower" in lowered or "longer" in lowered):
+        return {
+            "operations": [
+                {"op": "retime", "target": "middle", "factor": 1.3, "why": "user asked for a slower middle"}
+            ]
+        }
+    ordinal = re.search(r"(?:replace|swap|recast) the (\w+) (?:clip|shot|item)", lowered)
+    if ordinal and ordinal.group(1) in _ORDINALS:
+        index = _ORDINALS[ordinal.group(1)]
+        return {
+            "operations": [
+                {
+                    "op": "replace_item",
+                    "item": index,
+                    "with": "recast",
+                    "why": f"user asked to replace the {ordinal.group(1)} clip",
+                }
+            ]
+        }
+    ending = re.search(r"end (?:on|with) (.+?)(?:$|[.;])", lowered)
+    if ending:
+        return {
+            "operations": [
+                {
+                    "op": "swap_ending",
+                    "with_query": ending.group(1).strip(),
+                    "why": "user pinned a new ending",
+                }
+            ]
+        }
+    return {"operations": []}
 
 
 class MockVideoSession:
