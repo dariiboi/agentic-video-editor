@@ -990,7 +990,9 @@ def _generation_config():
     return types.GenerateContentConfig(
         temperature=0.2,
         responseMimeType="application/json",
-        maxOutputTokens=8192,
+        # 8192 truncated JSON mid-array on real-length assets (100% semantic
+        # failure on ~10-minute interviews); 65536 is Gemini 2.5 Flash's ceiling.
+        maxOutputTokens=65536,
     )
 
 
