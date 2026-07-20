@@ -26,7 +26,7 @@ class GeminiProvider:
                 response = client.models.generate_content(
                     model=self.model,
                     contents=[prompt],
-                    config=_generation_config(),
+                    config=_generation_config(video=False),
                 )
                 return parse_json_response(response.text or "{}")
             except Exception as exc:
@@ -71,7 +71,7 @@ class GeminiVideoSession:
                 response = self._client.models.generate_content(
                     model=self._model,
                     contents=[uploaded, prompt],
-                    config=_generation_config(),
+                    config=_generation_config(video=True),
                 )
                 return parse_json_response(response.text or "{}")
             except Exception as exc:
@@ -984,16 +984,24 @@ def _build_client(env_path: Path):
     return genai.Client(api_key=load_gemini_api_key(env_path))
 
 
-def _generation_config():
+def _generation_config(*, video: bool):
     from google.genai import types
 
-    return types.GenerateContentConfig(
+    kwargs: dict[str, Any] = dict(
         temperature=0.2,
         responseMimeType="application/json",
         # 8192 truncated JSON mid-array on real-length assets (100% semantic
         # failure on ~10-minute interviews); 65536 is Gemini 2.5 Flash's ceiling.
         maxOutputTokens=65536,
     )
+    if video:
+        # Gemini tokenizes video per sampled frame at a fixed cost set by this
+        # resolution tier, independent of the source file's own pixel
+        # resolution — LOW cuts per-frame tokens roughly 4x versus the
+        # unspecified default and is plenty for editorial description work
+        # (colors, actions, framing); it does not affect timestamp precision.
+        kwargs["mediaResolution"] = types.MediaResolution.MEDIA_RESOLUTION_LOW
+    return types.GenerateContentConfig(**kwargs)
 
 
 def _wait_for_file(client, uploaded):
