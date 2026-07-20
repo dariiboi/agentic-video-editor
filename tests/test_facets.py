@@ -163,3 +163,27 @@ def test_facets_uses_one_session_per_asset(tmp_path, run_ave, monkeypatch):
     assert counting.sessions_opened == 1
     assert counting.prompts_run == len(FACETS)
     assert summary.observations_created > 0
+
+
+def test_facets_limit_makes_progress_across_repeated_resumed_runs(tmp_path, run_ave):
+    """Regression: --limit smaller than the asset count must advance through
+    the backlog on repeated invocations, not re-select the same
+    already-complete assets forever (this stalled a real multi-asset ingest)."""
+    project_dir = _make_project(tmp_path, run_ave, clips=4)
+
+    for _ in range(4):
+        run_ave("facets", project_dir, "--provider", "mock", "--limit", "1", "--json")
+
+    project = load_project(project_dir)
+    with sqlite3.connect(project.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        asset_count = conn.execute("select count(*) as c from assets").fetchone()["c"]
+    assert asset_count == 4
+    # every asset should have gotten all facets, not just the first one repeatedly
+    with sqlite3.connect(project.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        per_asset_counts = conn.execute(
+            "select asset_id, count(distinct observation_type) as n from observations group by asset_id"
+        ).fetchall()
+    assert len(per_asset_counts) == 4
+    assert all(row["n"] == len(FACETS) for row in per_asset_counts)

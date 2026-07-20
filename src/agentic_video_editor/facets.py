@@ -229,7 +229,12 @@ def facet_analyze_project(
     provider = provider_for_name(provider_name, model=model, env_path=env_path)
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        assets = _assets_with_video_ref(conn, limit=limit)
+        # Pending must be computed over ALL ready assets before --limit is
+        # applied, otherwise a limit smaller than the asset count locks onto
+        # the same already-complete assets on every resumed run (limit picked
+        # by path order, unaware of completion) and never makes progress on
+        # the rest.
+        all_assets = _assets_with_video_ref(conn, limit=None)
         pending_by_asset = {
             str(asset["id"]): _pending_facets(
                 conn,
@@ -239,8 +244,18 @@ def facet_analyze_project(
                 budget=budget,
                 force=force,
             )
-            for asset in assets
+            for asset in all_assets
         }
+    # Already-done assets cost no API calls, so always report on them (for
+    # visibility into what's fully skipped); --limit only bounds how many
+    # assets *needing work* get processed this call, so repeated bounded runs
+    # make steady progress through the backlog instead of re-selecting the
+    # same complete assets forever.
+    already_done = [asset for asset in all_assets if not pending_by_asset[str(asset["id"])]]
+    needing_work = [asset for asset in all_assets if pending_by_asset[str(asset["id"])]]
+    if limit is not None:
+        needing_work = needing_work[:limit]
+    assets = already_done + needing_work
 
     totals = {"completed": 0, "run": 0, "skipped": 0, "observations": 0}
     for asset in assets:
