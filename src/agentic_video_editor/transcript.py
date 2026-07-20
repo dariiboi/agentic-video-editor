@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .chunking import remap_flat_items, resolve_video_units
 from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL, provider_for_name
 from .project import Project, utc_now
@@ -65,16 +66,32 @@ def transcribe_project(
     with connect_db(project.db_path) as conn:
         migrate(conn)
         assets = _assets_with_video_ref(conn, limit=limit, source=provider_name, force=force)
+        units_by_asset = {
+            str(asset["id"]): resolve_video_units(conn, str(asset["id"]), Path(str(asset["video_ref"])), None)
+            for asset in assets
+        }
 
     completed = 0
     spans_created = 0
     for asset in assets:
-        video_path = Path(str(asset["video_ref"]))
-        payload = provider.generate_video_json(video_path, TRANSCRIPT_PROMPT)
-        spans = payload.get("spans") or []
-        if not isinstance(spans, list):
+        asset_id = str(asset["id"])
+        units = units_by_asset[asset_id]
+        if len(units) == 1:
+            # unchunked path: unchanged from before chunking existed
+            video_path = Path(str(asset["video_ref"]))
+            payload = provider.generate_video_json(video_path, TRANSCRIPT_PROMPT)
+            spans = payload.get("spans") or []
+            if not isinstance(spans, list):
+                spans = []
+        else:
             spans = []
-        spans_created += _store_spans(project, str(asset["id"]), spans, provider_name)
+            for unit in units:
+                payload = provider.generate_video_json(unit.path, TRANSCRIPT_PROMPT)
+                unit_spans = payload.get("spans") or []
+                if not isinstance(unit_spans, list):
+                    unit_spans = []
+                spans.extend(remap_flat_items(unit_spans, unit))
+        spans_created += _store_spans(project, asset_id, spans, provider_name)
         completed += 1
 
     return TranscribeSummary(

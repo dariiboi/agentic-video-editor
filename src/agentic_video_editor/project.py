@@ -15,6 +15,7 @@ DB_NAME = "library.sqlite"
 
 PROJECT_DIRS = (
     "media/proxies",
+    "media/chunks",
     "media/thumbnails",
     "media/frame_strips",
     "analysis/runs",

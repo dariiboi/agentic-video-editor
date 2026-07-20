@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .chunking import remap_flat_items, resolve_video_units
 from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL, provider_for_name
 from .project import Project, utc_now
@@ -246,6 +247,12 @@ def facet_analyze_project(
             )
             for asset in all_assets
         }
+        units_by_asset = {
+            str(asset["id"]): resolve_video_units(
+                conn, str(asset["id"]), Path(str(asset["video_ref"])), _float(asset.get("duration_sec"))
+            )
+            for asset in all_assets
+        }
     # Already-done assets cost no API calls, so always report on them (for
     # visibility into what's fully skipped); --limit only bounds how many
     # assets *needing work* get processed this call, so repeated bounded runs
@@ -266,24 +273,64 @@ def facet_analyze_project(
         if not pending:
             continue
         duration_sec = _float(asset.get("duration_sec"))
-        # one upload serves every facet prompt for this asset
-        with provider.video_session(Path(str(asset["video_ref"]))) as session:
-            for facet in pending:
-                if facet == BUDGET_FACET:
-                    payload = session.generate_json(_budget_prompt())
-                    created = _store_budget(project, asset_id, payload, _source(provider_name, BUDGET_FACET), duration_sec)
-                else:
-                    payload = session.generate_json(facet_prompt(facet))
-                    created = _store_facet(
-                        project,
-                        asset_id,
-                        facet,
-                        _observation_items(payload),
-                        _source(provider_name, facet),
-                        duration_sec,
-                    )
-                totals["run"] += 1
+        units = units_by_asset[asset_id]
+        if len(units) == 1:
+            # unchunked path: unchanged from before chunking existed - one
+            # upload serves every facet prompt for this asset
+            with provider.video_session(Path(str(asset["video_ref"]))) as session:
+                for facet in pending:
+                    if facet == BUDGET_FACET:
+                        payload = session.generate_json(_budget_prompt())
+                        created = _store_budget(project, asset_id, payload, _source(provider_name, BUDGET_FACET), duration_sec)
+                    else:
+                        payload = session.generate_json(facet_prompt(facet))
+                        created = _store_facet(
+                            project,
+                            asset_id,
+                            facet,
+                            _observation_items(payload),
+                            _source(provider_name, facet),
+                            duration_sec,
+                        )
+                    totals["run"] += 1
+                    totals["observations"] += created
+        else:
+            # chunked path: one upload per chunk (still serving every facet
+            # prompt for that chunk), remapped onto the asset's absolute
+            # timeline and merged across chunks before a single store call
+            # per facet - the delete-then-insert store functions are keyed
+            # by (asset_id, source) only, so calling them once per chunk
+            # would have each chunk's store wipe the previous chunk's rows.
+            merged_facet_items: dict[str, list[dict[str, Any]]] = {facet: [] for facet in pending}
+            merged_budget_facets: dict[str, list[dict[str, Any]]] = {name: [] for name in FACETS}
+            for unit in units:
+                with provider.video_session(unit.path) as session:
+                    for facet in pending:
+                        if facet == BUDGET_FACET:
+                            payload = session.generate_json(_budget_prompt())
+                            facets_payload = payload.get("facets")
+                            if isinstance(facets_payload, dict):
+                                for name in FACETS:
+                                    items = facets_payload.get(name)
+                                    if isinstance(items, list):
+                                        merged_budget_facets[name].extend(
+                                            remap_flat_items([item for item in items if isinstance(item, dict)], unit)
+                                        )
+                        else:
+                            payload = session.generate_json(facet_prompt(facet))
+                            merged_facet_items[facet].extend(remap_flat_items(_observation_items(payload), unit))
+                        totals["run"] += 1
+            if BUDGET_FACET in pending:
+                created = _store_budget(
+                    project, asset_id, {"facets": merged_budget_facets}, _source(provider_name, BUDGET_FACET), duration_sec
+                )
                 totals["observations"] += created
+            else:
+                for facet in pending:
+                    created = _store_facet(
+                        project, asset_id, facet, merged_facet_items[facet], _source(provider_name, facet), duration_sec
+                    )
+                    totals["observations"] += created
         totals["completed"] += 1
 
     return FacetSummary(

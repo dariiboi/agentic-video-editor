@@ -7,6 +7,12 @@ from pathlib import Path
 
 from .align import align_project, align_summary
 from .analyze import analyze_project, summarize_local_analysis
+from .chunking import (
+    DEFAULT_CHUNK_LENGTH_SEC,
+    DEFAULT_MIN_ASSET_SEC,
+    chunk_summary,
+    generate_chunks_for_project,
+)
 from .context import build_editorial_context, context_summary
 from .corpus_profile import corpus_profile, corpus_profile_markdown
 from .critique import critique_render, review_summary
@@ -188,6 +194,22 @@ def build_parser() -> argparse.ArgumentParser:
     proxies_summary_parser.add_argument("project_dir", type=Path)
     proxies_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     proxies_summary_parser.set_defaults(func=_proxies_summary_command)
+
+    chunks_parser = subcommands.add_parser(
+        "chunks", help="Split very long assets into segments so Gemini passes run per-chunk"
+    )
+    chunks_parser.add_argument("project_dir", type=Path)
+    chunks_parser.add_argument("--chunk-length-sec", type=float, default=DEFAULT_CHUNK_LENGTH_SEC)
+    chunks_parser.add_argument("--min-asset-sec", type=float, default=DEFAULT_MIN_ASSET_SEC)
+    chunks_parser.add_argument("--limit", type=int)
+    chunks_parser.add_argument("--force", action="store_true", help="Regenerate chunks that already exist")
+    chunks_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    chunks_parser.set_defaults(func=_chunks_command)
+
+    chunks_summary_parser = subcommands.add_parser("chunks-summary", help="Summarize generated chunks")
+    chunks_summary_parser.add_argument("project_dir", type=Path)
+    chunks_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    chunks_summary_parser.set_defaults(func=_chunks_summary_command)
 
     facet_search_parser = subcommands.add_parser("facet-search", help="Full-text search facet observations")
     facet_search_parser.add_argument("project_dir", type=Path)
@@ -647,6 +669,24 @@ def _proxies_summary_command(args: argparse.Namespace) -> int:
     project = load_project(args.project_dir)
     data = proxy_summary(project)
     return _print_json_or_lines(args.json, data, "Proxies summary")
+
+
+def _chunks_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = generate_chunks_for_project(
+        project,
+        chunk_length_sec=args.chunk_length_sec,
+        min_asset_sec=args.min_asset_sec,
+        limit=args.limit,
+        force=args.force,
+    )
+    return _print_json_or_lines(args.json, data, "Chunks")
+
+
+def _chunks_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = chunk_summary(project)
+    return _print_json_or_lines(args.json, data, "Chunks summary")
 
 
 def _facet_search_command(args: argparse.Namespace) -> int:

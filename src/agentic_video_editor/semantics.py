@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .chunking import remap_semantic_payload, resolve_video_units
 from .db import connect_db, migrate
 from .gemini_provider import DEFAULT_MODEL, provider_for_name
 from .project import Project, utc_now
@@ -105,17 +106,42 @@ def semantic_analyze_project(
     with connect_db(project.db_path) as conn:
         migrate(conn)
         assets = _assets_with_video_ref(conn, limit=limit, source=provider_name, force=force)
+        units_by_asset = {
+            str(asset["id"]): resolve_video_units(
+                conn, str(asset["id"]), Path(str(asset["video_ref"])), _float(asset.get("duration_sec"), None)
+            )
+            for asset in assets
+        }
 
     totals = {"segments": 0, "selects": 0, "relationships": 0, "completed": 0}
     for asset in assets:
-        prompt = _semantic_prompt(_float(asset.get("duration_sec"), None))
-        payload = provider.generate_video_json(Path(str(asset["video_ref"])), prompt)
+        asset_id = str(asset["id"])
+        asset_duration = _float(asset.get("duration_sec"), None)
+        units = units_by_asset[asset_id]
+        if len(units) == 1:
+            # unchunked path: unchanged from before chunking existed
+            prompt = _semantic_prompt(asset_duration)
+            payload = provider.generate_video_json(Path(str(asset["video_ref"])), prompt)
+        else:
+            merged_segments: list[dict[str, Any]] = []
+            merged_relationships: list[dict[str, Any]] = []
+            index_offset = 0
+            for unit in units:
+                # scale the moment-count guidance to what THIS chunk covers,
+                # not the whole asset - otherwise a short chunk of a very
+                # long asset is told to invent moments to hit an inflated count
+                prompt = _semantic_prompt(unit.duration_sec)
+                unit_payload = provider.generate_video_json(unit.path, prompt)
+                segments, relationships, index_offset = remap_semantic_payload(unit_payload, unit, index_offset)
+                merged_segments.extend(segments)
+                merged_relationships.extend(relationships)
+            payload = {"segments": merged_segments, "relationships": merged_relationships}
         result = _store_semantics(
             project,
-            str(asset["id"]),
+            asset_id,
             payload,
             provider_name,
-            duration_sec=_float(asset.get("duration_sec"), None),
+            duration_sec=asset_duration,
         )
         totals["segments"] += result["segments"]
         totals["selects"] += result["selects"]
