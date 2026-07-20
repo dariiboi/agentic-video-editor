@@ -17,6 +17,13 @@ from .ingest import ingest_paths, list_assets
 from .intent import analyze_intent, intent_markdown
 from .casting import AnchorResolutionError
 from .planner import create_edit_plan
+from .proxy import (
+    DEFAULT_MAX_HEIGHT,
+    DEFAULT_MIN_DURATION_SEC,
+    DEFAULT_MIN_SIZE_MB,
+    generate_proxies_for_project,
+    proxy_summary,
+)
 from .revise import RevisionSourceError, plan_revision
 from .project import init_project, load_project
 from .qmd_bridge import export_cards, relate_from_qmd
@@ -162,6 +169,25 @@ def build_parser() -> argparse.ArgumentParser:
     facets_summary_parser.add_argument("project_dir", type=Path)
     facets_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     facets_summary_parser.set_defaults(func=_facets_summary_command)
+
+    proxies_parser = subcommands.add_parser(
+        "proxies", help="Generate low-res proxies for large/long assets to speed up Gemini uploads"
+    )
+    proxies_parser.add_argument("project_dir", type=Path)
+    proxies_parser.add_argument("--max-height", type=int, default=DEFAULT_MAX_HEIGHT)
+    proxies_parser.add_argument("--video-bitrate", default="1500k")
+    proxies_parser.add_argument("--audio-bitrate", default="128k")
+    proxies_parser.add_argument("--min-size-mb", type=float, default=DEFAULT_MIN_SIZE_MB)
+    proxies_parser.add_argument("--min-duration-sec", type=float, default=DEFAULT_MIN_DURATION_SEC)
+    proxies_parser.add_argument("--limit", type=int)
+    proxies_parser.add_argument("--force", action="store_true", help="Regenerate proxies that already exist")
+    proxies_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    proxies_parser.set_defaults(func=_proxies_command)
+
+    proxies_summary_parser = subcommands.add_parser("proxies-summary", help="Summarize generated proxies")
+    proxies_summary_parser.add_argument("project_dir", type=Path)
+    proxies_summary_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
+    proxies_summary_parser.set_defaults(func=_proxies_summary_command)
 
     facet_search_parser = subcommands.add_parser("facet-search", help="Full-text search facet observations")
     facet_search_parser.add_argument("project_dir", type=Path)
@@ -593,6 +619,34 @@ def _facets_summary_command(args: argparse.Namespace) -> int:
         for facet, count in data["by_facet"].items():
             print(f"  {facet}: {count}")
     return 0
+
+
+def _proxies_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    summary = generate_proxies_for_project(
+        project,
+        max_height=args.max_height,
+        video_bitrate=args.video_bitrate,
+        audio_bitrate=args.audio_bitrate,
+        min_size_mb=args.min_size_mb,
+        min_duration_sec=args.min_duration_sec,
+        limit=args.limit,
+        force=args.force,
+    )
+    data = {
+        "assets_requested": summary.assets_requested,
+        "assets_completed": summary.assets_completed,
+        "assets_failed": summary.assets_failed,
+        "bytes_before": summary.bytes_before,
+        "bytes_after": summary.bytes_after,
+    }
+    return _print_json_or_lines(args.json, data, "Proxies")
+
+
+def _proxies_summary_command(args: argparse.Namespace) -> int:
+    project = load_project(args.project_dir)
+    data = proxy_summary(project)
+    return _print_json_or_lines(args.json, data, "Proxies summary")
 
 
 def _facet_search_command(args: argparse.Namespace) -> int:
