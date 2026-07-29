@@ -2,6 +2,10 @@
 
 Local-first agentic video editor for turning raw footage into autonomous rough cuts.
 
+![Pipeline diagram: raw footage is ingested, the AI analyzes camera work, color and objects, people and mood, and dialogue, everything becomes a searchable creative library, and one brief becomes every deliverable format needed](docs/images/pipeline-diagram.svg)
+
+Built for teams that shoot far more footage than they can ever manually review — an ad agency's raw campaign footage, for example. The system logs what's actually in every shot (camera movement, color and objects, people and mood, spoken dialogue) into one searchable library, so a plain-language brief can be turned into every cut a campaign needs — social cutdowns, vertical stories, broadcast masters — without anyone re-watching the source footage by hand.
+
 The first slice provides the durable project spine:
 
 ```bash
