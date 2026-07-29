@@ -101,11 +101,14 @@ def semantic_analyze_project(
     env_path: Path = Path(".gemini_api.env"),
     limit: int | None = None,
     force: bool = False,
+    path_contains: str | None = None,
 ) -> SemanticSummary:
     provider = provider_for_name(provider_name, model=model, env_path=env_path)
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        assets = _assets_with_video_ref(conn, limit=limit, source=provider_name, force=force)
+        assets = _assets_with_video_ref(
+            conn, limit=limit, source=provider_name, force=force, path_contains=path_contains
+        )
         units_by_asset = {
             str(asset["id"]): resolve_video_units(
                 conn, str(asset["id"]), Path(str(asset["video_ref"])), _float(asset.get("duration_sec"), None)
@@ -218,7 +221,9 @@ def semantic_summary(project: Project) -> dict[str, Any]:
     }
 
 
-def _assets_with_video_ref(conn, *, limit: int | None, source: str, force: bool) -> list[dict[str, Any]]:
+def _assets_with_video_ref(
+    conn, *, limit: int | None, source: str, force: bool, path_contains: str | None = None
+) -> list[dict[str, Any]]:
     query = """
         select
             assets.id,
@@ -231,6 +236,9 @@ def _assets_with_video_ref(conn, *, limit: int | None, source: str, force: bool)
         where assets.project_id = ? and assets.ingest_status = ?
     """
     params: list[Any] = ["default", "ready"]
+    if path_contains:
+        query += " and assets.path like ?"
+        params.append(f"%{path_contains}%")
     if not force:
         query += """
             and not exists (

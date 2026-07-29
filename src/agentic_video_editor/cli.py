@@ -102,6 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     cutpoints_parser.add_argument("--gap-noise-db", type=float, default=-30.0)
     cutpoints_parser.add_argument("--gap-min-sec", type=float, default=0.12)
     cutpoints_parser.add_argument("--limit", type=int)
+    cutpoints_parser.add_argument("--force", action="store_true", help="Re-analyze assets that already have cut points")
     cutpoints_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     cutpoints_parser.set_defaults(func=_cutpoints_command)
 
@@ -122,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
     transcribe_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     transcribe_parser.add_argument("--limit", type=int)
     transcribe_parser.add_argument("--force", action="store_true", help="Re-analyze assets that already have spans")
+    transcribe_parser.add_argument(
+        "--path-contains", help="Only process assets whose path contains this substring (scope guard for multi-source ingests)"
+    )
     transcribe_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     transcribe_parser.set_defaults(func=_transcribe_command)
 
@@ -144,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     semantic_parser.add_argument("--env-path", type=Path, default=Path(".gemini_api.env"))
     semantic_parser.add_argument("--limit", type=int)
     semantic_parser.add_argument("--force", action="store_true", help="Re-analyze assets that already have segments")
+    semantic_parser.add_argument(
+        "--path-contains", help="Only process assets whose path contains this substring (scope guard for multi-source ingests)"
+    )
     semantic_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     semantic_parser.set_defaults(func=_semantic_analyze_command)
 
@@ -168,6 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     facets_parser.add_argument("--only", action="append", choices=FACETS, help="Run only this facet (repeatable)")
     facets_parser.add_argument("--budget", action="store_true", help="One combined prompt per asset instead of per-facet passes")
     facets_parser.add_argument("--force", action="store_true", help="Re-run facets that already have observations")
+    facets_parser.add_argument(
+        "--path-contains", help="Only process assets whose path contains this substring (scope guard for multi-source ingests)"
+    )
     facets_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     facets_parser.set_defaults(func=_facets_command)
 
@@ -187,6 +197,9 @@ def build_parser() -> argparse.ArgumentParser:
     proxies_parser.add_argument("--min-duration-sec", type=float, default=DEFAULT_MIN_DURATION_SEC)
     proxies_parser.add_argument("--limit", type=int)
     proxies_parser.add_argument("--force", action="store_true", help="Regenerate proxies that already exist")
+    proxies_parser.add_argument(
+        "--path-contains", help="Only process assets whose path contains this substring (scope guard for multi-source ingests)"
+    )
     proxies_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     proxies_parser.set_defaults(func=_proxies_command)
 
@@ -203,6 +216,9 @@ def build_parser() -> argparse.ArgumentParser:
     chunks_parser.add_argument("--min-asset-sec", type=float, default=DEFAULT_MIN_ASSET_SEC)
     chunks_parser.add_argument("--limit", type=int)
     chunks_parser.add_argument("--force", action="store_true", help="Regenerate chunks that already exist")
+    chunks_parser.add_argument(
+        "--path-contains", help="Only process assets whose path contains this substring (scope guard for multi-source ingests)"
+    )
     chunks_parser.add_argument("--json", action="store_true", help="Print machine-readable output")
     chunks_parser.set_defaults(func=_chunks_command)
 
@@ -508,10 +524,12 @@ def _cutpoints_command(args: argparse.Namespace) -> int:
         gap_noise_db=args.gap_noise_db,
         gap_min_sec=args.gap_min_sec,
         limit=args.limit,
+        force=args.force,
     )
     data = {
         "assets_requested": summary.assets_requested,
         "assets_completed": summary.assets_completed,
+        "assets_failed": summary.assets_failed,
         "scene_points": summary.scene_points,
         "audio_gap_points": summary.audio_gap_points,
     }
@@ -534,6 +552,7 @@ def _transcribe_command(args: argparse.Namespace) -> int:
         env_path=args.env_path,
         limit=args.limit,
         force=args.force,
+        path_contains=args.path_contains,
     )
     data = {
         "assets_requested": summary.assets_requested,
@@ -575,6 +594,7 @@ def _semantic_analyze_command(args: argparse.Namespace) -> int:
         env_path=args.env_path,
         limit=args.limit,
         force=args.force,
+        path_contains=args.path_contains,
     )
     data = {
         "assets_requested": summary.assets_requested,
@@ -620,6 +640,7 @@ def _facets_command(args: argparse.Namespace) -> int:
         force=args.force,
         only=args.only,
         budget=args.budget,
+        path_contains=args.path_contains,
     )
     data = {
         "assets_requested": summary.assets_requested,
@@ -654,6 +675,7 @@ def _proxies_command(args: argparse.Namespace) -> int:
         min_duration_sec=args.min_duration_sec,
         limit=args.limit,
         force=args.force,
+        path_contains=args.path_contains,
     )
     data = {
         "assets_requested": summary.assets_requested,
@@ -679,6 +701,7 @@ def _chunks_command(args: argparse.Namespace) -> int:
         min_asset_sec=args.min_asset_sec,
         limit=args.limit,
         force=args.force,
+        path_contains=args.path_contains,
     )
     return _print_json_or_lines(args.json, data, "Chunks")
 

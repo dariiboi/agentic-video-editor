@@ -1,4 +1,5 @@
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -7,7 +8,8 @@ from helpers import make_mp4
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from agentic_video_editor.cutpoints import snap_range, snap_time  # noqa: E402
+from agentic_video_editor.cutpoints import _detect_audio_gaps, _detect_scene_changes, snap_range, snap_time  # noqa: E402
+from agentic_video_editor.project import load_project  # noqa: E402
 
 
 def _point(time_sec, reason, detector="audio_gap"):
@@ -67,5 +69,68 @@ def test_cutpoints_cli_detects_and_summarizes(tmp_path, run_ave):
 
     assert result["assets_requested"] == 1
     assert result["assets_completed"] == 1
+    assert result["assets_failed"] == 0
     assert result["scene_points"] >= 0
     assert "cut_points" in summary
+
+
+def test_cutpoints_limit_makes_progress_across_repeated_resumed_runs(tmp_path, run_ave):
+    """Regression: --limit smaller than the asset count must advance through the
+    backlog on repeated invocations, not re-select the same assets forever.
+    _ready_assets has no per-facet "pending" notion like facets.py did, but it
+    has the same class of bug: an asset that legitimately produces zero
+    scene_boundaries rows (no cuts, no audio) must still be recognized as
+    "already analyzed" via the cutpoints_done marker, not re-analyzed forever."""
+    project_dir = tmp_path / "project"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    for index in range(4):
+        make_mp4(source_dir / f"clip_{index}.mp4", seconds=2)
+    run_ave("init", project_dir)
+    run_ave("ingest", project_dir, source_dir)
+
+    for _ in range(4):
+        run_ave("cutpoints", project_dir, "--limit", "1", "--json", timeout=60)
+
+    project = load_project(project_dir)
+    with sqlite3.connect(project.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        marked = conn.execute(
+            "select count(distinct asset_id) as n from media_artifacts where artifact_type='cutpoints_done'"
+        ).fetchone()["n"]
+    assert marked == 4
+
+    # a fifth call finds nothing left pending
+    final = json.loads(run_ave("cutpoints", project_dir, "--json", timeout=60).stdout)
+    assert final["assets_requested"] == 0
+
+
+def test_cutpoints_force_reanalyzes_marked_assets(tmp_path, run_ave):
+    project_dir = tmp_path / "project"
+    source_dir = tmp_path / "source"
+    source_dir.mkdir()
+    make_mp4(source_dir / "clip_a.mp4", seconds=2)
+    run_ave("init", project_dir)
+    run_ave("ingest", project_dir, source_dir)
+
+    run_ave("cutpoints", project_dir, "--json", timeout=60)
+    second = json.loads(run_ave("cutpoints", project_dir, "--json", timeout=60).stdout)
+    assert second["assets_requested"] == 0
+
+    forced = json.loads(run_ave("cutpoints", project_dir, "--force", "--json", timeout=60).stdout)
+    assert forced["assets_requested"] == 1
+    assert forced["assets_completed"] == 1
+
+
+def test_detect_scene_changes_reports_failure_not_empty_success(tmp_path):
+    missing = tmp_path / "does_not_exist.mp4"
+    points, ok = _detect_scene_changes(missing, 0.3)
+    assert points == []
+    assert ok is False
+
+
+def test_detect_audio_gaps_reports_failure_not_empty_success(tmp_path):
+    missing = tmp_path / "does_not_exist.mp4"
+    points, ok = _detect_audio_gaps(missing, 2.0, -30.0, 0.12)
+    assert points == []
+    assert ok is False

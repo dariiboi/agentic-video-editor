@@ -100,6 +100,7 @@ def generate_proxies_for_project(
     min_duration_sec: float = DEFAULT_MIN_DURATION_SEC,
     limit: int | None = None,
     force: bool = False,
+    path_contains: str | None = None,
 ) -> ProxySummary:
     with connect_db(project.db_path) as conn:
         migrate(conn)
@@ -107,7 +108,9 @@ def generate_proxies_for_project(
         # --limit is applied (see facets.py commit 17b1bdf): otherwise a
         # limit smaller than the eligible count re-selects the same
         # already-proxied assets on every resumed run and never advances.
-        eligible = _eligible_assets(conn, min_size_mb=min_size_mb, min_duration_sec=min_duration_sec)
+        eligible = _eligible_assets(
+            conn, min_size_mb=min_size_mb, min_duration_sec=min_duration_sec, path_contains=path_contains
+        )
         proxied_ids = _already_proxied_asset_ids(conn)
 
     if force:
@@ -149,19 +152,23 @@ def generate_proxies_for_project(
     )
 
 
-def _eligible_assets(conn, *, min_size_mb: float, min_duration_sec: float) -> list[dict[str, Any]]:
+def _eligible_assets(
+    conn, *, min_size_mb: float, min_duration_sec: float, path_contains: str | None = None
+) -> list[dict[str, Any]]:
     min_size_bytes = min_size_mb * 1024 * 1024
-    rows = conn.execute(
-        """
+    query = """
         select id, path, size_bytes, duration_sec
         from assets
         where project_id = ?
           and ingest_status = ?
           and (coalesce(size_bytes, 0) >= ? or coalesce(duration_sec, 0) >= ?)
-        order by path
-        """,
-        ("default", "ready", min_size_bytes, min_duration_sec),
-    ).fetchall()
+    """
+    params: list[Any] = ["default", "ready", min_size_bytes, min_duration_sec]
+    if path_contains:
+        query += " and path like ?"
+        params.append(f"%{path_contains}%")
+    query += " order by path"
+    rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
 

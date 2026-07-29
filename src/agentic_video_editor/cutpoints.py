@@ -15,6 +15,13 @@ from .project import Project, utc_now
 SCENE_DETECTOR = "ffmpeg_scdet"
 AUDIO_GAP_DETECTOR = "audio_gap"
 
+# Bookkeeping marker in media_artifacts (same pattern as proxy.py/chunking.py):
+# an asset can legitimately produce zero scene_boundaries rows (a single static
+# shot with no audio), so "any rows exist" cannot distinguish "analyzed, found
+# nothing" from "never analyzed" - only this marker can, and only ffmpeg
+# successes (not crashes/errors) earn it.
+CUTPOINTS_ARTIFACT_TYPE = "cutpoints_done"
+
 SCENE_TIME_RE = re.compile(r"pts_time:(?P<time>[0-9.]+)")
 SCENE_SCORE_RE = re.compile(r"lavfi\.scene_score=(?P<score>[0-9.]+)")
 SILENCE_START_RE = re.compile(r"silence_start:\s*(?P<time>[0-9.]+)")
@@ -25,6 +32,7 @@ SILENCE_END_RE = re.compile(r"silence_end:\s*(?P<time>[0-9.]+)")
 class CutPointSummary:
     assets_requested: int
     assets_completed: int
+    assets_failed: int
     scene_points: int
     audio_gap_points: int
 
@@ -36,6 +44,7 @@ def detect_cut_points(
     gap_noise_db: float = -30.0,
     gap_min_sec: float = 0.12,
     limit: int | None = None,
+    force: bool = False,
 ) -> CutPointSummary:
     """Populate scene_boundaries with frame-accurate snap targets.
 
@@ -45,28 +54,47 @@ def detect_cut_points(
     """
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        assets = _ready_assets(conn, limit=limit)
+        # Pending must be computed over ALL ready assets before --limit is
+        # applied (see facets.py commit 17b1bdf): otherwise a limit smaller
+        # than the asset count re-selects the same already-analyzed assets on
+        # every resumed run and never advances. "Already analyzed" is tracked
+        # via CUTPOINTS_ARTIFACT_TYPE, not "has scene_boundaries rows" - an
+        # asset with zero shot changes and no audio legitimately has none.
+        all_assets = _ready_assets(conn, limit=None)
+        done_ids = set() if force else _already_analyzed_asset_ids(conn)
+    pending = [asset for asset in all_assets if force or str(asset["id"]) not in done_ids]
+    if limit is not None:
+        pending = pending[:limit]
 
-    totals = {"scene": 0, "gaps": 0, "completed": 0}
-    for asset in assets:
+    totals = {"scene": 0, "gaps": 0, "completed": 0, "failed": 0}
+    for asset in pending:
+        asset_id = str(asset["id"])
         source = Path(str(asset["path"]))
         duration = float(asset["duration_sec"] or 0.0)
         if duration <= 0 or not source.exists():
+            totals["failed"] += 1
             continue
-        scene_points = _detect_scene_changes(source, scene_threshold)
-        gap_points = (
-            _detect_audio_gaps(source, duration, gap_noise_db, gap_min_sec)
-            if asset["has_audio"]
-            else []
-        )
-        _store_points(project, str(asset["id"]), scene_points, gap_points, scene_threshold, gap_noise_db, gap_min_sec)
+        scene_points, scene_ok = _detect_scene_changes(source, scene_threshold)
+        if asset["has_audio"]:
+            gap_points, gap_ok = _detect_audio_gaps(source, duration, gap_noise_db, gap_min_sec)
+        else:
+            gap_points, gap_ok = [], True
+        if not (scene_ok and gap_ok):
+            # A real ffmpeg failure (bad exit code) must NOT be silently
+            # treated as "analyzed, found nothing" - that would permanently
+            # hide a failed asset behind a false completion marker.
+            totals["failed"] += 1
+            continue
+        _store_points(project, asset_id, scene_points, gap_points, scene_threshold, gap_noise_db, gap_min_sec)
+        _mark_analyzed(project, asset_id)
         totals["scene"] += len(scene_points)
         totals["gaps"] += len(gap_points)
         totals["completed"] += 1
 
     return CutPointSummary(
-        assets_requested=len(assets),
+        assets_requested=len(pending),
         assets_completed=totals["completed"],
+        assets_failed=totals["failed"],
         scene_points=totals["scene"],
         audio_gap_points=totals["gaps"],
     )
@@ -229,7 +257,33 @@ def _ready_assets(conn, *, limit: int | None) -> list[dict[str, Any]]:
     return [dict(row) for row in conn.execute(query, params).fetchall()]
 
 
-def _detect_scene_changes(source: Path, threshold: float) -> list[dict[str, Any]]:
+def _already_analyzed_asset_ids(conn) -> set[str]:
+    rows = conn.execute(
+        "select distinct asset_id from media_artifacts where artifact_type = ?",
+        (CUTPOINTS_ARTIFACT_TYPE,),
+    ).fetchall()
+    return {str(row["asset_id"]) for row in rows}
+
+
+def _mark_analyzed(project: Project, asset_id: str) -> None:
+    with connect_db(project.db_path) as conn:
+        migrate(conn)
+        # Exactly one marker row per asset, mirroring proxy.py/chunking.py.
+        conn.execute(
+            "delete from media_artifacts where asset_id = ? and artifact_type = ?",
+            (asset_id, CUTPOINTS_ARTIFACT_TYPE),
+        )
+        conn.execute(
+            """
+            insert into media_artifacts (id, project_id, asset_id, artifact_type, path, metadata_json, created_at)
+            values (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (f"cutpoints_{uuid.uuid4().hex[:16]}", "default", asset_id, CUTPOINTS_ARTIFACT_TYPE, "", None, utc_now()),
+        )
+        conn.commit()
+
+
+def _detect_scene_changes(source: Path, threshold: float) -> tuple[list[dict[str, Any]], bool]:
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -248,6 +302,11 @@ def _detect_scene_changes(source: Path, threshold: float) -> list[dict[str, Any]
         check=False,
         text=True,
     )
+    if completed.returncode != 0:
+        # A real decode/probe failure, not "zero scene changes found" - the
+        # caller must not mark this asset as analyzed on the strength of an
+        # empty (because it errored) points list.
+        return [], False
     output = f"{completed.stdout}\n{completed.stderr}"
     points: list[dict[str, Any]] = []
     pending_time: float | None = None
@@ -266,7 +325,7 @@ def _detect_scene_changes(source: Path, threshold: float) -> list[dict[str, Any]
                 }
             )
             pending_time = None
-    return points
+    return points, True
 
 
 def _detect_audio_gaps(
@@ -274,7 +333,7 @@ def _detect_audio_gaps(
     duration: float,
     noise_db: float,
     min_gap_sec: float,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], bool]:
     completed = subprocess.run(
         [
             "ffmpeg",
@@ -292,6 +351,8 @@ def _detect_audio_gaps(
         check=False,
         text=True,
     )
+    if completed.returncode != 0:
+        return [], False
     output = f"{completed.stdout}\n{completed.stderr}"
     points: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -306,7 +367,7 @@ def _detect_audio_gaps(
             time_sec = float(end_match.group("time"))
             if 0.0 < time_sec < duration:
                 points.append({"time_sec": time_sec, "confidence": None, "reason": "gap_end"})
-    return points
+    return points, True
 
 
 def _store_points(

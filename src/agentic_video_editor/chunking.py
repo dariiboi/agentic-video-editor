@@ -135,6 +135,7 @@ def generate_chunks_for_project(
     min_asset_sec: float = DEFAULT_MIN_ASSET_SEC,
     limit: int | None = None,
     force: bool = False,
+    path_contains: str | None = None,
 ) -> dict[str, Any]:
     with connect_db(project.db_path) as conn:
         migrate(conn)
@@ -142,7 +143,9 @@ def generate_chunks_for_project(
         # eligibility over ALL qualifying assets before --limit slices it, so
         # repeated bounded runs advance through the backlog instead of
         # re-selecting the same already-chunked assets forever.
-        all_eligible = _eligible_assets(conn, chunk_length_sec=chunk_length_sec, min_asset_sec=min_asset_sec)
+        all_eligible = _eligible_assets(
+            conn, chunk_length_sec=chunk_length_sec, min_asset_sec=min_asset_sec, path_contains=path_contains
+        )
         chunked_ids = _already_chunked_asset_ids(conn)
 
     pending = all_eligible if force else [asset for asset in all_eligible if asset["id"] not in chunked_ids]
@@ -263,9 +266,10 @@ def remap_semantic_payload(
     return segments, relationships, index_offset + len(segments)
 
 
-def _eligible_assets(conn, *, chunk_length_sec: float, min_asset_sec: float) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
+def _eligible_assets(
+    conn, *, chunk_length_sec: float, min_asset_sec: float, path_contains: str | None = None
+) -> list[dict[str, Any]]:
+    query = """
         select
             assets.id,
             assets.duration_sec,
@@ -276,10 +280,13 @@ def _eligible_assets(conn, *, chunk_length_sec: float, min_asset_sec: float) -> 
         where assets.project_id = ?
           and assets.ingest_status = ?
           and coalesce(assets.duration_sec, 0) > ?
-        order by assets.path
-        """,
-        ("default", "ready", min_asset_sec),
-    ).fetchall()
+    """
+    params: list[Any] = ["default", "ready", min_asset_sec]
+    if path_contains:
+        query += " and assets.path like ?"
+        params.append(f"%{path_contains}%")
+    query += " order by assets.path"
+    rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
 
 

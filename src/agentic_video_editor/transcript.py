@@ -61,11 +61,14 @@ def transcribe_project(
     env_path: Path = Path(".gemini_api.env"),
     limit: int | None = None,
     force: bool = False,
+    path_contains: str | None = None,
 ) -> TranscribeSummary:
     provider = provider_for_name(provider_name, model=model, env_path=env_path)
     with connect_db(project.db_path) as conn:
         migrate(conn)
-        assets = _assets_with_video_ref(conn, limit=limit, source=provider_name, force=force)
+        assets = _assets_with_video_ref(
+            conn, limit=limit, source=provider_name, force=force, path_contains=path_contains
+        )
         units_by_asset = {
             str(asset["id"]): resolve_video_units(conn, str(asset["id"]), Path(str(asset["video_ref"])), None)
             for asset in assets
@@ -148,7 +151,9 @@ def transcript_summary(project: Project) -> dict[str, Any]:
     return {"spans": total["count"], "by_kind": {row["kind"]: row["count"] for row in rows}}
 
 
-def _assets_with_video_ref(conn, *, limit: int | None, source: str, force: bool) -> list[dict[str, Any]]:
+def _assets_with_video_ref(
+    conn, *, limit: int | None, source: str, force: bool, path_contains: str | None = None
+) -> list[dict[str, Any]]:
     query = """
         select
             assets.id,
@@ -160,6 +165,14 @@ def _assets_with_video_ref(conn, *, limit: int | None, source: str, force: bool)
         where assets.project_id = ? and assets.ingest_status = ?
     """
     params: list[Any] = ["default", "ready"]
+    if path_contains:
+        # A scope guard: without this, a batch command has no way to exclude
+        # unrelated assets sitting at ingest_status='ready' from an earlier,
+        # different batch - it will silently pick up the first such asset by
+        # path and never reach the intended ones (see the ingest-robustness
+        # incident log for the real-world case this caused).
+        query += " and assets.path like ?"
+        params.append(f"%{path_contains}%")
     if not force:
         query += """
             and not exists (

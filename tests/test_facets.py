@@ -187,3 +187,51 @@ def test_facets_limit_makes_progress_across_repeated_resumed_runs(tmp_path, run_
         ).fetchall()
     assert len(per_asset_counts) == 4
     assert all(row["n"] == len(FACETS) for row in per_asset_counts)
+
+
+def test_facets_path_contains_scopes_to_matching_assets_only(tmp_path, run_ave):
+    """Regression: a batch command with no scope guard will happily pick up an
+    unrelated asset sitting in ingest_status='ready' from a different source
+    folder (e.g. leftover audio from an earlier batch) and process it instead
+    of - or before - the intended assets, with no error to signal the mistake.
+    --path-contains lets a run be scoped so this cannot happen silently."""
+    project_dir = tmp_path / "project"
+    source_dir = tmp_path / "source"
+    (source_dir / "CAMERA").mkdir(parents=True)
+    (source_dir / "BOOM").mkdir(parents=True)
+    make_mp4(source_dir / "CAMERA" / "cam_a.mp4", seconds=2)
+    make_mp4(source_dir / "BOOM" / "boom_a.mp4", seconds=2)
+    run_ave("init", project_dir)
+    run_ave("ingest", project_dir, source_dir)
+
+    scoped = _json(run_ave("facets", project_dir, "--provider", "mock", "--path-contains", "CAMERA", "--json"))
+    assert scoped["assets_requested"] == 1
+    assert scoped["assets_completed"] == 1
+
+    project = load_project(project_dir)
+    with sqlite3.connect(project.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        camera_id = conn.execute("select id from assets where file_name='cam_a.mp4'").fetchone()["id"]
+        boom_id = conn.execute("select id from assets where file_name='boom_a.mp4'").fetchone()["id"]
+        camera_facets = conn.execute(
+            "select count(distinct observation_type) as n from observations where asset_id=?", (camera_id,)
+        ).fetchone()["n"]
+        boom_facets = conn.execute(
+            "select count(distinct observation_type) as n from observations where asset_id=?", (boom_id,)
+        ).fetchone()["n"]
+    assert camera_facets == len(FACETS)
+    assert boom_facets == 0
+
+    # omitting --path-contains still reaches the rest (regression safety).
+    # assets_requested counts both assets (cam_a is already-done and reported
+    # for skip visibility, per the facets.py convention); assets_completed is
+    # the meaningful check here - only boom_a still had real work to do.
+    unscoped = _json(run_ave("facets", project_dir, "--provider", "mock", "--json"))
+    assert unscoped["assets_requested"] == 2
+    assert unscoped["assets_completed"] == 1
+    with sqlite3.connect(project.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        boom_facets_after = conn.execute(
+            "select count(distinct observation_type) as n from observations where asset_id=?", (boom_id,)
+        ).fetchone()["n"]
+    assert boom_facets_after == len(FACETS)

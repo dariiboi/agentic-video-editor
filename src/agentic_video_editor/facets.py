@@ -225,6 +225,7 @@ def facet_analyze_project(
     force: bool = False,
     only: list[str] | None = None,
     budget: bool = False,
+    path_contains: str | None = None,
 ) -> FacetSummary:
     requested_facets = _validate_only(only)
     provider = provider_for_name(provider_name, model=model, env_path=env_path)
@@ -235,7 +236,7 @@ def facet_analyze_project(
         # the same already-complete assets on every resumed run (limit picked
         # by path order, unaware of completion) and never makes progress on
         # the rest.
-        all_assets = _assets_with_video_ref(conn, limit=None)
+        all_assets = _assets_with_video_ref(conn, limit=None, path_contains=path_contains)
         pending_by_asset = {
             str(asset["id"]): _pending_facets(
                 conn,
@@ -404,7 +405,7 @@ def _pending_facets(
     return pending
 
 
-def _assets_with_video_ref(conn, *, limit: int | None) -> list[dict[str, Any]]:
+def _assets_with_video_ref(conn, *, limit: int | None, path_contains: str | None = None) -> list[dict[str, Any]]:
     query = """
         select
             assets.id,
@@ -415,9 +416,12 @@ def _assets_with_video_ref(conn, *, limit: int | None) -> list[dict[str, Any]]:
         left join media_artifacts proxy
             on proxy.asset_id = assets.id and proxy.artifact_type = 'proxy'
         where assets.project_id = ? and assets.ingest_status = ?
-        order by assets.path
     """
     params: list[Any] = ["default", "ready"]
+    if path_contains:
+        query += " and assets.path like ?"
+        params.append(f"%{path_contains}%")
+    query += " order by assets.path"
     if limit is not None:
         query += " limit ?"
         params.append(limit)
