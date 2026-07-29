@@ -43,7 +43,7 @@ class GeminiProvider:
         The Files API keeps uploads for 48h; deleting only on session exit is
         what makes a multi-prompt analysis cost tokens instead of uploads.
         """
-        session = GeminiVideoSession(_build_client(self.env_path), self.model, video_path)
+        session = GeminiVideoSession(_build_client(self.env_path), self.model, video_path, env_path=self.env_path)
         try:
             yield session
         finally:
@@ -57,10 +57,11 @@ class GeminiProvider:
 class GeminiVideoSession:
     """One uploaded video file serving many generate calls."""
 
-    def __init__(self, client, model: str, video_path: Path) -> None:
+    def __init__(self, client, model: str, video_path: Path, *, env_path: Path | None = None) -> None:
         self._client = client
         self._model = model
         self._video_path = video_path
+        self._env_path = env_path
         self._uploaded = None
 
     def generate_json(self, prompt: str) -> dict[str, Any]:
@@ -79,8 +80,15 @@ class GeminiVideoSession:
                 if not (_is_retryable(exc) or _is_file_failure(exc)) or attempt == 2:
                     raise
                 if _is_file_failure(exc):
-                    # only a dead handle justifies paying for a re-upload
+                    # A file-processing failure on a client whose connection
+                    # pool has already made requests retries far less
+                    # reliably than a fresh client + fresh upload (observed
+                    # empirically: a brand-new client succeeded consistently
+                    # where retrying on the same client kept failing) - so
+                    # rebuild the client, not just the uploaded file.
                     self.close()
+                    if self._env_path is not None:
+                        self._client = _build_client(self._env_path)
                 time.sleep(5 * (attempt + 1))
         raise RuntimeError("Gemini request failed") from last_error
 
